@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import Carbon
+import IOKit.pwr_mgt
 
 struct KeyIdentity: Hashable { let device: Int; let code: Int }
 // flags: the flags the key itself needs when pressed (layout shift/option,
@@ -28,8 +29,12 @@ enum KeyMapping {
             0xffe1: 56, 0xffe2: 60, 0xffe3: 59, 0xffe4: 62,
             0xffe7: 55, 0xffe8: 54, 0xffe9: 58, 0xffea: 61,
             0xffeb: 55, 0xffec: 54, 0xfe03: 61, 0xffe5: 57,
-            0xff7e: 104, 0xff23: 104, 0xff22: 102, 0xff2d: 104,
-            0xff8d: 76, 0xffaa: 67, 0xffab: 69, 0xffad: 78, 0xffae: 65, 0xffaf: 75,
+            0xff7e: 104, 0xff21: 102, 0xff22: 102, 0xff23: 104, 0xff24: 104,
+            0xff25: 104, 0xff26: 104, 0xff27: 104, 0xff28: 102, 0xff29: 102,
+            0xff2a: 102, 0xff2d: 104, 0xff30: 102, 0xff7f: 71,
+            0xff8d: 76, 0xff95: 115, 0xff96: 123, 0xff97: 126, 0xff98: 124,
+            0xff99: 125, 0xff9a: 116, 0xff9b: 121, 0xff9c: 119, 0xff9e: 114,
+            0xff9f: 117, 0xffaa: 67, 0xffab: 69, 0xffad: 78, 0xffae: 65, 0xffaf: 75,
             0xffb0: 82, 0xffb1: 83, 0xffb2: 84, 0xffb3: 85, 0xffb4: 86,
             0xffb5: 87, 0xffb6: 88, 0xffb7: 89, 0xffb8: 91, 0xffb9: 92,
             0xffbe: 122, 0xffbf: 120, 0xffc0: 99, 0xffc1: 118, 0xffc2: 96,
@@ -63,22 +68,27 @@ enum KeyMapping {
         guard let text = unicode(keysym) else { throw SenderError("Unsupported logical keysym") }
         // A target IME may not expose a Unicode layout. In that case fall back
         // to the layout used beneath the input method, not to a guessed US map.
-        let source = TISCopyCurrentKeyboardLayoutInputSource().takeRetainedValue()
-        if let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) {
-            let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
-            let layout = UnsafeRawPointer(CFDataGetBytePtr(data)).assumingMemoryBound(to: UCKeyboardLayout.self)
-            for combination: UInt32 in [0, UInt32(shiftKey >> 8), UInt32(optionKey >> 8), UInt32((shiftKey | optionKey) >> 8)] {
-                for code: UInt16 in 0...127 {
-                    var state: UInt32 = 0, length = 0
-                    var chars = [UniChar](repeating: 0, count: 8)
-                    let result = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), combination,
-                        UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit), &state, chars.count, &length, &chars)
-                    if result == noErr, length > 0, String(utf16CodeUnits: chars, count: length) == text {
-                        var mapped = flags
-                        mapped.remove([.maskShift, .maskAlternate, .maskAlphaShift])
-                        if combination & UInt32(shiftKey >> 8) != 0 { mapped.insert(.maskShift) }
-                        if combination & UInt32(optionKey >> 8) != 0 { mapped.insert(.maskAlternate) }
-                        return MappedKey(code: code, text: nil, flags: mapped)
+        let sources = [
+            TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+            TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
+        ].compactMap { $0 }
+        for source in sources {
+            if let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) {
+                let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
+                let layout = UnsafeRawPointer(CFDataGetBytePtr(data)).assumingMemoryBound(to: UCKeyboardLayout.self)
+                for combination: UInt32 in [0, UInt32(shiftKey >> 8), UInt32(optionKey >> 8), UInt32((shiftKey | optionKey) >> 8)] {
+                    for code: UInt16 in 0...127 {
+                        var state: UInt32 = 0, length = 0
+                        var chars = [UniChar](repeating: 0, count: 8)
+                        let result = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), combination,
+                            UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit), &state, chars.count, &length, &chars)
+                        if result == noErr, length > 0, String(utf16CodeUnits: chars, count: length) == text {
+                            var mapped = flags
+                            mapped.remove([.maskShift, .maskAlternate, .maskAlphaShift])
+                            if combination & UInt32(shiftKey >> 8) != 0 { mapped.insert(.maskShift) }
+                            if combination & UInt32(optionKey >> 8) != 0 { mapped.insert(.maskAlternate) }
+                            return MappedKey(code: code, text: nil, flags: mapped)
+                        }
                     }
                 }
             }
@@ -95,6 +105,8 @@ enum KeyMapping {
 final class RemoteInput {
     typealias Sink = (CGEvent) -> Void
     private let bounds: () -> CGRect
+    private let displays: () -> [CGRect]
+    private let live: Bool
     private let sink: Sink
     // A real HID-state source, as upstream InputInjector uses: menu tracking
     // treats sourceless synthetic clicks as malformed.
@@ -102,26 +114,78 @@ final class RemoteInput {
     private var held: [KeyIdentity: MappedKey] = [:]
     private var buttons = Set<Int>()
     private var lastPoint = CGPoint.zero
+    private var lastNorm = CGPoint(x: 0.5, y: 0.5)
+    private var hasLastPoint = false
     private var flags: CGEventFlags = []
     private var scrollX = 0.0, scrollY = 0.0
     private var scrollActive = false
     private var lastClickTime = [Int: TimeInterval]()
     private var lastClickPoint = [Int: CGPoint]()
     private var clickCounts = [Int: Int64]()
+    private var lastActivityTime = 0.0
+    private var lastPointerTime = 0.0
+    private var lastDisplayQueryTime = 0.0
+    private var cachedDisplays: [CGRect] = []
+    private var cachedBounds = CGRect.zero
+    private var activityAssertion: IOPMAssertionID = 0
 
     init(displayID: CGDirectDisplayID) {
         bounds = { CGDisplayBounds(displayID) }
-        sink = { $0.post(tap: .cghidEventTap) }
+        displays = {
+            var count: UInt32 = 0
+            var list = [CGDirectDisplayID](repeating: 0, count: 16)
+            CGGetActiveDisplayList(16, &list, &count)
+            let rects = (0..<Int(count)).map { CGDisplayBounds(list[$0]) }.filter { !$0.isEmpty }
+            return rects.isEmpty ? [CGDisplayBounds(displayID)] : rects
+        }
+        live = true
+        sink = { event in
+            guard AXIsProcessTrusted() else { return }
+            event.post(tap: .cghidEventTap)
+        }
     }
     // Unit tests create CGEvents but never post, query a display or request TCC.
-    init(bounds: @escaping () -> CGRect, sink: @escaping Sink) { self.bounds = bounds; self.sink = sink }
+    init(bounds: @escaping () -> CGRect, sink: @escaping Sink) {
+        self.bounds = bounds
+        self.displays = { [bounds()] }
+        self.live = false
+        self.sink = sink
+    }
     var heldCount: Int { held.count + buttons.count }
+
+    private func refreshDisplayCache(now: TimeInterval) {
+        if cachedBounds.isEmpty || cachedDisplays.isEmpty || now - lastDisplayQueryTime >= 1.0 {
+            lastDisplayQueryTime = now
+            cachedBounds = bounds()
+            cachedDisplays = displays().filter { !$0.isEmpty }
+        }
+    }
 
     private func point(_ object: [String: Any]) throws -> CGPoint {
         let x = try Wire.number(object, "x", 0...1), y = try Wire.number(object, "y", 0...1)
-        let rect = bounds()
+        if live { refreshDisplayCache(now: ProcessInfo.processInfo.systemUptime) }
+        let rect = live && !cachedBounds.isEmpty ? cachedBounds : bounds()
         guard !rect.isEmpty else { throw SenderError("Virtual display is unavailable") }
         return CGPoint(x: rect.minX + x * max(0, rect.width - 1), y: rect.minY + y * max(0, rect.height - 1))
+    }
+
+    private func projectToDisplays(_ target: CGPoint) -> CGPoint {
+        refreshDisplayCache(now: ProcessInfo.processInfo.systemUptime)
+        let rects = cachedDisplays
+        guard !rects.isEmpty else { return target }
+        var best = target
+        var bestDist = Double.infinity
+        for r in rects {
+            let cx = min(max(target.x, r.minX), r.maxX - 1)
+            let cy = min(max(target.y, r.minY), r.maxY - 1)
+            let d = hypot(target.x - cx, target.y - cy)
+            if d < bestDist {
+                bestDist = d
+                best = CGPoint(x: cx, y: cy)
+                if d == 0 { break }
+            }
+        }
+        return best
     }
     private func postKey(_ mapped: MappedKey, down: Bool, flags: CGEventFlags, repeatKey: Bool = false) {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: mapped.code, keyDown: down) else { return }
@@ -152,6 +216,13 @@ final class RemoteInput {
     }
     func handle(_ object: [String: Any], scrollScale: Double = 1) throws {
         guard let type = object["type"] as? String else { throw SenderError("Missing input type") }
+        if live {
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastActivityTime >= 1.0 {
+                lastActivityTime = now
+                IOPMAssertionDeclareUserActivity("LOCachy Remote Input" as CFString, kIOPMUserActiveLocal, &activityAssertion)
+            }
+        }
         switch type {
         case "key":
             let identity = KeyIdentity(device: try Wire.integer(object, "device", 1...Int(UInt32.max)), code: try Wire.integer(object, "code", 0...767))
@@ -175,9 +246,15 @@ final class RemoteInput {
                 if let mapped = held[identity] {
                     postKey(mapped, down: true, flags: mapped.flags.union(mapped.modifier), repeatKey: true)
                 }
-            } else if held[identity] == nil {
+            } else {
+                if let prev = held.removeValue(forKey: identity) {
+                    var releaseFlags = before
+                    releaseFlags.subtract(prev.modifier)
+                    postKey(prev, down: false, flags: releaseFlags)
+                }
                 guard held.count < 128 else { throw SenderError("Too many held keys") }
                 let sym = UInt32(try Wire.integer(object, "keysym", 0...Int(UInt32.max)))
+                if sym == 0 { return }
                 var mapped = try KeyMapping.logical(sym, flags: before)
                 mapped.modifier = KeyMapping.modifierBit(sym)
                 flags = before.union(mapped.modifier)
@@ -185,16 +262,57 @@ final class RemoteInput {
                 postKey(mapped, down: true, flags: mapped.flags.union(mapped.modifier))
             }
         case "pointer":
-            lastPoint = try point(object)
+            let mapped = try point(object)
+            let x = try Wire.number(object, "x", 0...1), y = try Wire.number(object, "y", 0...1)
+            let now = ProcessInfo.processInfo.systemUptime
+            let syncCursor = !hasLastPoint || (live && now - lastPointerTime > 0.3)
+            lastPointerTime = now
+            var dx = 0.0, dy = 0.0
+            if object["dx"] != nil || object["dy"] != nil {
+                dx = object["dx"] == nil ? 0 : try Wire.number(object, "dx", -16384...16384)
+                dy = object["dy"] == nil ? 0 : try Wire.number(object, "dy", -16384...16384)
+                if syncCursor {
+                    hasLastPoint = true
+                    lastPoint = live ? (CGEvent(source: nil)?.location ?? mapped) : mapped
+                }
+                lastPoint = projectToDisplays(CGPoint(x: lastPoint.x + dx, y: lastPoint.y + dy))
+                lastNorm = CGPoint(x: x, y: y)
+            } else if !hasLastPoint {
+                hasLastPoint = true
+                lastNorm = CGPoint(x: x, y: y)
+                lastPoint = live ? (CGEvent(source: nil)?.location ?? mapped) : mapped
+            } else {
+                if syncCursor, let cur = CGEvent(source: nil)?.location {
+                    lastPoint = cur
+                }
+                let rect = !cachedBounds.isEmpty ? cachedBounds : bounds()
+                let refW = max(1440.0, Double(rect.width)), refH = max(960.0, Double(rect.height))
+                dx = (x - lastNorm.x) * refW
+                dy = (y - lastNorm.y) * refH
+                if x <= 0.0005 && lastNorm.x <= 0.0005 { dx = -18.0 }
+                else if x >= 0.9995 && lastNorm.x >= 0.9995 { dx = 18.0 }
+                if y <= 0.0005 && lastNorm.y <= 0.0005 { dy = -18.0 }
+                else if y >= 0.9995 && lastNorm.y >= 0.9995 { dy = 18.0 }
+                lastNorm = CGPoint(x: x, y: y)
+                lastPoint = projectToDisplays(CGPoint(x: lastPoint.x + dx, y: lastPoint.y + dy))
+            }
             let button = buttons.contains(272) ? 272 : buttons.contains(273) ? 273 : 274
             let cgButton: CGMouseButton = button == 272 ? .left : button == 273 ? .right : .center
             let type: CGEventType = buttons.isEmpty ? .mouseMoved : button == 272 ? .leftMouseDragged : button == 273 ? .rightMouseDragged : .otherMouseDragged
             if let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: lastPoint, mouseButton: cgButton) {
+                event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
+                event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
                 event.flags = flags; sink(event)
             }
         case "button":
             let button = try Wire.integer(object, "button", 272...274), down = try Wire.integer(object, "state", 0...1) == 1
-            lastPoint = try point(object)
+            let mapped = try point(object)
+            if !hasLastPoint {
+                hasLastPoint = true
+                lastPoint = live ? (CGEvent(source: nil)?.location ?? mapped) : mapped
+            } else if live, let current = CGEvent(source: nil)?.location {
+                lastPoint = current
+            }
             if down ? buttons.insert(button).inserted : buttons.remove(button) != nil { mouse(button, down, at: lastPoint) }
         case "touch":
             let phase = object["phase"] as? String

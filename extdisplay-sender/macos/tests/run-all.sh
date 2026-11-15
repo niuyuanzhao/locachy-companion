@@ -1,7 +1,5 @@
 #!/bin/sh
-# Build the sender and run every check that needs no display, permission or
-# cable: protocol/input/pairing tests and loopback TLS interoperability.
-# Each step rebuilds its binary first; any compile or test failure stops here.
+# Build the sender and run protocol, discovery fixture and loopback TLS checks.
 set -eu
 
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -17,7 +15,13 @@ xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos
     "$HERE/tests/ProtocolTests.swift" -o "$OUT/tests/protocol-tests"
 "$OUT/tests/protocol-tests"
 
+xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+    -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework IOKit -framework Network \
+    "$HERE/sources/Wire.swift" "$HERE/sources/PairingCode.swift" "$HERE/sources/LinkInterfaces.swift" "$HERE/sources/Discovery.swift" \
+    "$HERE/tests/ConnectionTests.swift" -o "$OUT/tests/connection-tests"
+"$OUT/tests/connection-tests"
+
 "$HERE/tests/tls-loopback.sh" "$OUT"
 
 "$OUT/locachy-macos-sender" --check
-printf '%s\n' 'PASS: all sender checks (build, protocol, loopback TLS); no cable or Mac session was exercised'
+printf '%s\n' 'PASS: all sender checks'

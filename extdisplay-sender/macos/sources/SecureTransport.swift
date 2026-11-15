@@ -8,9 +8,12 @@ struct CableEndpoint {
     let host: String
     let port: UInt16
     let interface: String
+    let interfaceIndex: UInt32
 
     init(host: String, port: UInt16, interface: String) throws {
-        guard port > 0, !interface.isEmpty, if_nametoindex(interface) != 0 else { throw SenderError("Invalid dedicated interface or port") }
+        let index = if_nametoindex(interface)
+        guard port > 0, !interface.isEmpty, index != 0 else { throw SenderError("Invalid dedicated interface or port") }
+        interfaceIndex = index
         // Never DNS-resolve a name or route to a non-link-local network.
         let parts = host.split(separator: "%", omittingEmptySubsequences: false)
         let bare = String(parts[0])
@@ -20,8 +23,8 @@ struct CableEndpoint {
         let is6 = bare.withCString { inet_pton(AF_INET6, $0, &v6) } == 1
         if is4 {
             let octets = withUnsafeBytes(of: v4.s_addr) { Array($0) }
-            guard octets[0] == 169, octets[1] == 254, parts.count == 1 else { throw SenderError("Only link-local addresses are accepted") }
-            self.host = bare
+            guard octets[0] == 169, octets[1] == 254 else { throw SenderError("Only link-local addresses are accepted") }
+            self.host = bare + "%" + interface
         } else if is6 {
             let octets = withUnsafeBytes(of: v6) { Array($0) }
             guard octets[0] == 0xfe, octets[1] & 0xc0 == 0x80 else { throw SenderError("Only link-local addresses are accepted") }
@@ -42,6 +45,7 @@ private func dispatchBytes(_ data: Data) -> dispatch_data_t {
 final class SecureTransport {
     private var connection: NWConnection?
     private let queue = DispatchQueue(label: "locachy.sender.transport")
+    private let sendLock = NSLock()
     private var reader = FrameReader()
     private var timer: DispatchSourceTimer?
     private var lastReceived = ProcessInfo.processInfo.systemUptime
@@ -49,6 +53,11 @@ final class SecureTransport {
     private var ended = false
     private var queuedVideo = 0
     private var queuedControl = 0
+    var canAcceptVideo: Bool {
+        sendLock.lock()
+        defer { sendLock.unlock() }
+        return queuedVideo < 2
+    }
     var onReady: (() -> Void)?
     var onControl: (([String: Any]) -> Void)?
     var onEnd: ((String) -> Void)?
@@ -98,35 +107,24 @@ final class SecureTransport {
         return parameters
     }
 
-    // NWInterface objects only come from a started monitor's path updates; a
-    // monitor that was never started reports no interfaces at all.
-    static func resolveInterface(named name: String, timeout: TimeInterval = 3) throws -> NWInterface {
-        let monitor = NWPathMonitor()
-        let lock = NSLock()
-        let done = DispatchSemaphore(value: 0)
-        var found: NWInterface?
-        var signalled = false
-        monitor.pathUpdateHandler = { path in
-            lock.lock(); defer { lock.unlock() }
-            guard !signalled, let match = path.availableInterfaces.first(where: { $0.name == name }) else { return }
-            found = match
-            signalled = true
-            done.signal()
+    // NWPathMonitor.availableInterfaces omits link-local-only Thunderbolt
+    // bridges (bridge0 has no default route while Wi-Fi/Ethernet is active).
+    // IPv6Address/IPv4Address("addr%iface").interface constructs the exact
+    // kernel-scoped NWInterface directly from the validated interface name.
+    static func scopedInterface(for endpoint: CableEndpoint) throws -> NWInterface {
+        guard if_nametoindex(endpoint.interface) == endpoint.interfaceIndex else {
+            throw SenderError("Selected interface changed; discover the receiver again")
         }
-        monitor.start(queue: DispatchQueue(label: "locachy.sender.interface"))
-        defer { monitor.cancel() }
-        _ = done.wait(timeout: .now() + timeout)
-        lock.lock(); defer { lock.unlock() }
-        guard let selected = found else { throw SenderError("Selected interface is unavailable to Network.framework") }
-        guard selected.type == .wiredEthernet || selected.type == .other else {
-            throw SenderError("Selected interface is not a dedicated wired path")
+        let resolved = IPv6Address(endpoint.host)?.interface ?? IPv4Address(endpoint.host)?.interface
+        guard let selected = resolved, selected.name == endpoint.interface, UInt32(selected.index) == endpoint.interfaceIndex else {
+            throw SenderError("Selected interface is unavailable to Network.framework")
         }
         return selected
     }
 
     init(endpoint: CableEndpoint, key: Data) throws {
         guard key.count == PairingCode.bytes else { throw SenderError("Pairing code must be 16 bytes") }
-        let selected = try Self.resolveInterface(named: endpoint.interface)
+        let selected = try Self.scopedInterface(for: endpoint)
         let parameters = Self.cableParameters(key: key, queue: queue, interface: selected)
         connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: parameters)
     }
@@ -143,8 +141,8 @@ final class SecureTransport {
                     self.lastReceived = ProcessInfo.processInfo.systemUptime
                     self.onReady?()
                     self.receive()
-                case .waiting, .failed:
-                    self.finish("Dedicated cable connection failed")
+                case .waiting(let error), .failed(let error):
+                    self.finish("Thunderbolt connection or pairing failed: \(error). Check the cable, current receiver code and Local Network permission")
                 case .cancelled:
                     self.finish("Connection closed")
                 default: break
@@ -197,14 +195,20 @@ final class SecureTransport {
         let framed = try Wire.frame(payload)
         queue.async { [weak self] in
             guard let self, self.ready, !self.ended, let connection = self.connection else { return }
-            // Never discard an encoded P frame: doing so would break its
-            // reference chain. A saturated connection ends instead of growing
-            // an unbounded queue or leaving a frozen screen controlling a Mac.
-            guard video ? self.queuedVideo < 3 : self.queuedControl < 64 else { self.finish("Peer is not consuming the stream"); return }
-            if video { self.queuedVideo += 1 } else { self.queuedControl += 1 }
+            self.sendLock.lock()
+            let currentVideo = self.queuedVideo
+            let currentControl = self.queuedControl
+            let allowed = video ? currentVideo < 32 : currentControl < 64
+            if allowed {
+                if video { self.queuedVideo += 1 } else { self.queuedControl += 1 }
+            }
+            self.sendLock.unlock()
+            guard allowed else { self.finish("Peer is not consuming the stream"); return }
             connection.send(content: framed, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
+                self.sendLock.lock()
                 if video { self.queuedVideo -= 1 } else { self.queuedControl -= 1 }
+                self.sendLock.unlock()
                 if error != nil { self.finish("Cable send failed") }
             })
         }

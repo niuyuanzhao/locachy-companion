@@ -8,7 +8,8 @@ struct SenderError: Error, CustomStringConvertible {
 }
 
 // OpenDisplay pv3 framing with a mandatory authenticated LOCachy v1 profile.
-// No discovery, mirror fallback, clipboard, file transfer, or power commands.
+// Discovery is separate and unauthenticated. No mirror fallback, clipboard,
+// file transfer, or power commands exist in the authenticated stream.
 enum Wire {
     static let maxFrame = 4 * 1024 * 1024
     static let maxControl = 32767
@@ -84,10 +85,10 @@ struct Panel: Equatable {
         let panel = hello["panel"] as? [String: Any] ?? hello
         width = try Wire.integer(panel, panel["width"] == nil ? "pixelsWide" : "width", 64...4096)
         height = try Wire.integer(panel, panel["height"] == nil ? "pixelsHigh" : "height", 64...4096)
-        let requestedScale = try Wire.number(panel, "scale", 0.5...4)
-        // CGVirtualDisplay supports integral 1x and 2x backing. Explicitly use
-        // 1x for fractional panel scales instead of silently changing pixels.
-        scale = requestedScale == 2 ? 2 : 1
+        _ = try Wire.number(panel, "scale", 0.5...4)
+        // High density displays (e.g. 2160x1440, 1920x1080+, 2K/3K/4K) always
+        // create a HiDPI (@2x) virtual display with multi-step fractional scale modes.
+        scale = (width >= 1600 || height >= 1000) ? 2 : 1
         // VirtualCanvasSizing rounds to even points; capture verifies the
         // resulting mode and the receiver reads the real size from the SPS.
         guard width * height <= 16 * 1024 * 1024 else { throw SenderError("Panel is too large") }
@@ -105,7 +106,7 @@ struct Panel: Equatable {
         // labelled as anything else, so it is refused outright.
         let offered = caps.compactMap { $0["codec"] as? String }
         guard offered.contains("h264") else { throw SenderError("Receiver does not offer H.264") }
-        codec = "h264"
+        codec = offered.contains("hevc") ? "hevc" : "h264"
         guard caps.contains(where: { capability in
             guard capability["codec"] as? String == codec else { return false }
             for (key, required) in [("maxWidth", width), ("maxHeight", height), ("maxFramesPerSecond", fps), ("maxFrameRate", fps)] {

@@ -1,9 +1,62 @@
 #!/bin/sh
-# Build the LOCachy Mac extended-display sender without installing or launching it.
+# Build the LOCachy Mac extended-display sender.
 # The upstream source is fetched by immutable commit and verified before use.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+sign_outputs() {
+    SIGN_PRODUCT=$1
+    SIGN_APP=$2
+    SIGN_DIR=$3
+    SIGN_TMP=$4
+    mkdir -p -- "$SIGN_DIR" 2>/dev/null || SIGN_DIR="$SIGN_TMP/signing"
+    mkdir -p -- "$SIGN_DIR"
+    KEYCHAIN="$SIGN_DIR/signing.keychain-db"
+    if [ ! -f "$KEYCHAIN" ] && [ -n "${USER:-}" ] && [ -f "/Users/$USER/Library/Application Support/LOCachy/signing.keychain-db" ]; then
+        cp -- "/Users/$USER/Library/Application Support/LOCachy/signing.keychain-db" "$KEYCHAIN" 2>/dev/null || true
+    fi
+    if [ ! -f "$KEYCHAIN" ]; then
+        CNF="$SIGN_TMP/codesign-openssl.cnf"
+        cat >"$CNF" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3
+prompt = no
+[dn]
+CN = LOCachy Extended Display Signing
+[v3]
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+basicConstraints = critical, CA:FALSE
+EOF
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SIGN_TMP/cs.key" -out "$SIGN_TMP/cs.crt" -days 3650 -config "$CNF" >/dev/null 2>&1
+        openssl pkcs12 -export -out "$SIGN_TMP/cs.p12" -inkey "$SIGN_TMP/cs.key" -in "$SIGN_TMP/cs.crt" -passout pass:locachy -legacy >/dev/null 2>&1 || \
+            openssl pkcs12 -export -out "$SIGN_TMP/cs.p12" -inkey "$SIGN_TMP/cs.key" -in "$SIGN_TMP/cs.crt" -passout pass:locachy >/dev/null 2>&1
+        security create-keychain -p locachy "$KEYCHAIN" >/dev/null 2>&1 || true
+        security unlock-keychain -p locachy "$KEYCHAIN" >/dev/null 2>&1 || true
+        security set-keychain-settings "$KEYCHAIN" >/dev/null 2>&1 || true
+        security import "$SIGN_TMP/cs.p12" -k "$KEYCHAIN" -P locachy -T /usr/bin/codesign >/dev/null 2>&1 || true
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k locachy "$KEYCHAIN" >/dev/null 2>&1 || true
+        rm -f -- "$CNF" "$SIGN_TMP/cs.key" "$SIGN_TMP/cs.crt" "$SIGN_TMP/cs.p12"
+    else
+        security unlock-keychain -p locachy "$KEYCHAIN" >/dev/null 2>&1 || true
+    fi
+    codesign --force --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.sender "$SIGN_PRODUCT" >/dev/null 2>&1 || \
+        codesign --force --sign - --identifier org.locachy.extdisplay.sender "$SIGN_PRODUCT" >/dev/null 2>&1 || true
+    cp -- "$SIGN_PRODUCT" "$SIGN_APP/Contents/MacOS/locachy-macos-sender"
+    codesign --force --deep --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || \
+        codesign --force --deep --sign - --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || true
+}
+
+if [ "${1:-}" = "--sign" ]; then
+    [ $# -eq 4 ] || { printf '%s\n' 'usage: build.sh --sign PRODUCT APP SIGN_DIR' >&2; exit 2; }
+    TMP_SIGN=$(mktemp -d "${TMPDIR:-/tmp}/locachy-sign.XXXXXX")
+    trap 'rm -rf -- "$TMP_SIGN"' EXIT
+    sign_outputs "$2" "$3" "$4" "$TMP_SIGN"
+    exit 0
+fi
+
 OUT=${1:-/tmp/locachy-macos-sender-build}
 UPSTREAM_COMMIT=0f44853adc5d44646a9e4d74e4516db460efb8bb
 UPSTREAM_SHA256=dba0ece10f0d0d810b63f64269d62dd3eaea52058f7566ea1159fb17be0f1a15
@@ -12,6 +65,7 @@ ARCHIVE="$OUT/opendisplay-$UPSTREAM_COMMIT.tar.gz"
 SOURCE="$OUT/opendisplay-$UPSTREAM_COMMIT"
 GENERATED="$OUT/generated"
 PRODUCT="$OUT/locachy-macos-sender"
+APP="$OUT/LOCachy Extended Display.app"
 
 case "$(uname -s)" in Darwin) ;; *) printf '%s\n' 'The macOS sender must be built on macOS with xcrun.' >&2; exit 2 ;; esac
 command -v xcrun >/dev/null || { printf '%s\n' 'xcrun is required.' >&2; exit 2; }
@@ -41,8 +95,8 @@ SWIFTC=$(xcrun --find swiftc)
 TARGET="$(uname -m)-apple-macos13.0"
 "$SWIFTC" -swift-version 5 -parse-as-library -target "$TARGET" -sdk "$SDK" -O \
     -import-objc-header "$GENERATED/Mac/CGVirtualDisplayPrivate.h" \
-    -framework AppKit -framework Carbon -framework CoreGraphics -framework CoreMedia \
-    -framework CoreServices -framework CoreVideo -framework Network \
+    -framework AppKit -framework ApplicationServices -framework Carbon -framework CoreGraphics -framework CoreImage -framework CoreMedia \
+    -framework CoreServices -framework CoreVideo -framework IOKit -framework Metal -framework Network \
     -framework ScreenCaptureKit -framework Security -framework VideoToolbox \
     "$GENERATED/Mac/OriginRestore.swift" \
     "$GENERATED/Mac/VirtualCanvasSizing.swift" \
@@ -53,8 +107,40 @@ TARGET="$(uname -m)-apple-macos13.0"
     "$ROOT/sources/SecureTransport.swift" \
     "$ROOT/sources/Input.swift" \
     "$ROOT/sources/Capture.swift" \
+    "$ROOT/sources/LinkInterfaces.swift" \
+    "$ROOT/sources/Discovery.swift" \
+    "$ROOT/sources/ConnectionWindow.swift" \
     "$ROOT/sources/SenderMain.swift" \
     -o "$PRODUCT"
 
+# The app bundle is the normal no-argument entry point. The raw binary remains
+# available for the documented manual CLI and for protocol tests.
+rm -rf -- "$APP"
+mkdir -p -- "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp -- "$PRODUCT" "$APP/Contents/MacOS/locachy-macos-sender"
+cat >"$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDisplayName</key><string>LOCachy Extended Display</string>
+<key>CFBundleExecutable</key><string>locachy-macos-sender</string>
+<key>CFBundleIdentifier</key><string>org.locachy.extdisplay.sender</string>
+<key>CFBundleName</key><string>LOCachy Extended Display</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.3.0</string>
+<key>CFBundleVersion</key><string>0.3.0</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSUIElement</key><true/>
+<key>NSLocalNetworkUsageDescription</key><string>Discover and connect to the LOCachy extended display over a dedicated Thunderbolt or USB4 link.</string>
+<key>NSBonjourServices</key><array><string>_locachy-ext._tcp</string></array>
+<key>NSScreenCaptureUsageDescription</key><string>Capture the LOCachy virtual display so it can be shown on the LOCachy computer.</string>
+<key>NSAccessibilityUsageDescription</key><string>Apply keyboard and pointer input from LOCachy to the virtual display.</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+</dict></plist>
+PLIST
+SIGN_DIR="${LOCACHY_SIGN_DIR:-${HOME:-$OUT}/Library/Application Support/LOCachy}"
+sign_outputs "$PRODUCT" "$APP" "$SIGN_DIR" "$OUT"
+
 printf 'PASS: built %s\n' "$PRODUCT"
-printf 'Not launched: this recipe never creates a virtual display or requests TCC permissions.\n'
+printf 'PASS: built app bundle %s\n' "$APP"
+

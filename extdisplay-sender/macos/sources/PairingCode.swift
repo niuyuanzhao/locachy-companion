@@ -2,11 +2,8 @@
 import Darwin
 import Foundation
 
-// The pairing secret is 128 random bits, shown on the LOCachy screen as RFC 4648
-// base32 (26 characters, no padding, groups separated by '-'), and typed here.
-// It is read only from a terminal prompt (echo off) or, when stdin is not a
-// terminal, from a single line on stdin (tests and scripts). It is never taken
-// from argv, the environment, a file, the Keychain, or logs.
+// The per-session secret is 128 random bits, encoded as RFC 4648 base32
+// (26 characters, no padding, optional '-' separators).
 enum PairingCode {
     static let characters = 26
     static let bytes = 16
