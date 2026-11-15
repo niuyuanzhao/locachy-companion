@@ -53,7 +53,10 @@ if [ "${1:-}" = "--sign" ]; then
     [ $# -eq 4 ] || { printf '%s\n' 'usage: build.sh --sign PRODUCT APP SIGN_DIR' >&2; exit 2; }
     TMP_SIGN=$(mktemp -d "${TMPDIR:-/tmp}/locachy-sign.XXXXXX")
     trap 'rm -rf -- "$TMP_SIGN"' EXIT
-    sign_outputs "$2" "$3" "$4" "$TMP_SIGN"
+    rm -rf -- "$4/LOCachy Extended Display.app"
+    cp -R -- "$3" "$4/LOCachy Extended Display.app"
+    sign_outputs "$2" "$4/LOCachy Extended Display.app" "$4" "$TMP_SIGN"
+    cp -- "$4/LOCachy Extended Display.app/Contents/MacOS/locachy-macos-sender" "$3/Contents/MacOS/locachy-macos-sender" 2>/dev/null || true
     exit 0
 fi
 
