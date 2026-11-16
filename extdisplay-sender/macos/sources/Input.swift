@@ -153,6 +153,10 @@ final class RemoteInput {
     }
     var heldCount: Int { held.count + buttons.count }
 
+    func invalidateDisplayCache() {
+        lastDisplayQueryTime = 0
+    }
+
     private func refreshDisplayCache(now: TimeInterval) {
         if cachedBounds.isEmpty || cachedDisplays.isEmpty || now - lastDisplayQueryTime >= 1.0 {
             lastDisplayQueryTime = now

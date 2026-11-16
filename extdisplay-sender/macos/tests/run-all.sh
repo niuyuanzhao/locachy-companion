@@ -21,6 +21,15 @@ xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos
     "$HERE/tests/ConnectionTests.swift" -o "$OUT/tests/connection-tests"
 "$OUT/tests/connection-tests"
 
+xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+    -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+    -import-objc-header "$OUT/generated/Mac/CGVirtualDisplayPrivate.h" \
+    -framework CoreGraphics -framework CoreImage -framework CoreVideo \
+    "$OUT/generated/Mac/OriginRestore.swift" "$OUT/generated/Mac/VirtualCanvasSizing.swift" \
+    "$OUT/generated/Mac/VirtualDisplay.swift" "$HERE/sources/UpstreamLog.swift" \
+    "$HERE/tests/DisplayModeTests.swift" -o "$OUT/tests/display-mode-tests"
+"$OUT/tests/display-mode-tests"
+
 "$HERE/tests/tls-loopback.sh" "$OUT"
 
 "$OUT/locachy-macos-sender" --check

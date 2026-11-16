@@ -18,6 +18,6 @@ When `extdisplay` is opened on LOCachy over a Thunderbolt/USB4 cable, hub, dock,
 
 ## Display Geometry and Input
 
-The receiver reports its physical panel dimensions (`pixelsWide × pixelsHigh`) in the session handshake. From those dimensions, the sender creates a single exact 1:1 virtual display (`points = pixels ÷ 2` at `@2x` HiDPI when divisible into even points for high-density panels, otherwise `pixels` at `@1x`) with no saved mode presets or fractional downscaling, and streams at the panel's physical resolution using hardware HEVC 4:4:4 (or H.264 fallback).
+The receiver reports its physical panel dimensions (`pixelsWide × pixelsHigh`) in the session handshake. From those dimensions, the sender computes the exact 1:1 HiDPI virtual display (`pixels ÷ 2` points at `@2x` when divisible into even points, otherwise `@1x`) with no cross-session presets, and registers five proportional modes (`2.0×`, `1.75×`, `1.5×`, `1.25×`, `1.0×`) for **System Settings → Displays** (**Larger Text ↔ More Space**). Native `1:1` modes stream without rescaling; intermediate HiDPI modes capture at native backing resolution and downscale cleanly via Metal Mitchell bicubic (`B=1/3, C=1/3`) in sRGB before hardware HEVC 4:4:4 encoding (or H.264 fallback).
 
 Keyboard, trackpad, and mouse input from LOCachy are forwarded across all active Mac displays. When the cable is unplugged, the virtual display is removed and the service returns to waiting for the next connection.

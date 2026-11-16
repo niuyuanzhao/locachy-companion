@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import CoreGraphics
+import CoreImage
 import CoreMedia
 import Foundation
 import IOKit.pwr_mgt
+import Metal
 import ScreenCaptureKit
 import VideoToolbox
 
@@ -21,6 +23,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var input: RemoteInput?
+    private var modeTask: Task<Void, Never>?
     private var refineTimer: DispatchSourceTimer?
     private var lastImage: CVImageBuffer?
     private var stopped = false
@@ -30,7 +33,15 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var scrollScale = 1.0
     private var activeCodec = "h264"
     private var recovering = false
+    private var captureWidth = 0
+    private var captureHeight = 0
     private var sleepAssertion: IOPMAssertionID = 0
+    private lazy var ciContext: CIContext? = {
+        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+        return CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+    }()
+    private var scalePool: CVPixelBufferPool?
+    private let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
     init(transport: SecureTransport, panel: Panel) {
         self.transport = transport
@@ -93,13 +104,16 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                   cur.pixelWidth == plan.requested.pixelsWide, cur.pixelHeight == plan.requested.pixelsHigh else {
                 throw SenderError("Virtual display did not enter the requested 1:1 mode")
             }
-            let width = cur.pixelWidth, height = cur.pixelHeight
+            let width = panel.width, height = panel.height
+            let capW = cur.pixelWidth, capH = cur.pixelHeight
+            captureWidth = capW
+            captureHeight = capH
             let target = try await shareable(id)
             try Task.checkCancellation()
             try configureEncoder(width: width, height: height)
             input = RemoteInput(displayID: id)
             let filter = SCContentFilter(display: target, excludingWindows: [])
-            let configuration = makeStreamConfiguration(width: width, height: height)
+            let configuration = makeStreamConfiguration(width: capW, height: capH)
             let capture = SCStream(filter: filter, configuration: configuration, delegate: self)
             try capture.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
             stream = capture
@@ -107,6 +121,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                                   "height": height, "framesPerSecond": panel.fps])
             try await capture.startCapture()
             try Task.checkCancellation()
+            startModeWatcher(id: id, requested: plan.requested)
             SenderLog.info("Extended display \(id) is active at \(plan.requested.pointsWide)x\(plan.requested.pointsHigh) @\(plan.requested.scale)x (\(width)x\(height), \(activeCodec))")
         } catch {
             stop("Capture setup failed")
@@ -146,14 +161,16 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     @MainActor
-    private func rebuildStream(id: CGDirectDisplayID) async {
+    private func rebuildStream(id: CGDirectDisplayID, sourceWidth: Int, sourceHeight: Int) async {
         guard !stopped, !recovering else { return }
         recovering = true
         defer { recovering = false }
         try? await Task.sleep(for: .milliseconds(60))
         guard !stopped, let updated = try? await shareable(id) else { return }
         guard !stopped else { return }
-        let cfg = makeStreamConfiguration(width: panel.width, height: panel.height)
+        captureWidth = sourceWidth
+        captureHeight = sourceHeight
+        let cfg = makeStreamConfiguration(width: sourceWidth, height: sourceHeight)
         let filter = SCContentFilter(display: updated, excludingWindows: [])
         if let active = stream {
             do {
@@ -184,7 +201,61 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private func recoverStream() async {
         try? await Task.sleep(for: .milliseconds(150))
         guard !stopped, let display else { return }
-        await rebuildStream(id: display.displayID)
+        let m = CGDisplayCopyDisplayMode(display.displayID)
+        await rebuildStream(id: display.displayID,
+                            sourceWidth: m?.pixelWidth ?? panel.width,
+                            sourceHeight: m?.pixelHeight ?? panel.height)
+    }
+
+    @MainActor
+    private func startModeWatcher(id: CGDirectDisplayID, requested: VirtualCanvasSize) {
+        let settleUntil = ProcessInfo.processInfo.systemUptime + 2.0
+        var lastSize = CGSize(width: requested.pointsWide, height: requested.pointsHigh)
+        var lastPixels = CGSize(width: requested.pixelsWide, height: requested.pixelsHigh)
+        var correctedDuringSettle = false
+        var tried1xPanel = false
+        modeTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, !self.stopped,
+                      var m = CGDisplayCopyDisplayMode(id) else { continue }
+                let now = ProcessInfo.processInfo.systemUptime
+                if now < settleUntil {
+                    if m.width != requested.pointsWide || m.height != requested.pointsHigh ||
+                       m.pixelWidth != requested.pixelsWide || m.pixelHeight != requested.pixelsHigh {
+                        correctedDuringSettle = true
+                        self.selectNativeMode(id: id, pointsWide: requested.pointsWide, pointsHigh: requested.pointsHigh,
+                                              pixelsWide: requested.pixelsWide, pixelsHigh: requested.pixelsHigh)
+                    }
+                    continue
+                }
+                if correctedDuringSettle {
+                    correctedDuringSettle = false
+                    if m.width == requested.pointsWide, m.height == requested.pointsHigh,
+                       m.pixelWidth == requested.pixelsWide, m.pixelHeight == requested.pixelsHigh {
+                        await self.rebuildStream(id: id, sourceWidth: m.pixelWidth, sourceHeight: m.pixelHeight)
+                    }
+                }
+                if m.width == self.panel.width, m.height == self.panel.height, m.pixelWidth > self.panel.width {
+                    if !tried1xPanel {
+                        tried1xPanel = true
+                        self.selectNativeMode(id: id, pointsWide: self.panel.width, pointsHigh: self.panel.height,
+                                              pixelsWide: self.panel.width, pixelsHigh: self.panel.height)
+                        if let updated = CGDisplayCopyDisplayMode(id) { m = updated }
+                    }
+                } else if m.width != self.panel.width || m.height != self.panel.height {
+                    tried1xPanel = false
+                }
+                let size = CGSize(width: m.width, height: m.height)
+                let pixels = CGSize(width: m.pixelWidth, height: m.pixelHeight)
+                guard size.width > 0, size.height > 0, (size != lastSize || pixels != lastPixels) else { continue }
+                lastSize = size
+                lastPixels = pixels
+                self.input?.invalidateDisplayCache()
+                await self.rebuildStream(id: id, sourceWidth: m.pixelWidth, sourceHeight: m.pixelHeight)
+                SenderLog.info("Updated capture stream for scaled mode \(m.width)x\(m.height) (px=\(m.pixelWidth)x\(m.pixelHeight))")
+            }
+        }
     }
 
     @MainActor
@@ -231,7 +302,6 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 60 as CFNumber)
@@ -334,6 +404,40 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         refineTimer = timer
     }
 
+    private func scaledBuffer(_ image: CVImageBuffer) -> CVImageBuffer {
+        let srcW = CVPixelBufferGetWidth(image), srcH = CVPixelBufferGetHeight(image)
+        if srcW == panel.width && srcH == panel.height { return image }
+        guard let ciContext else { return image }
+        if scalePool == nil {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: panel.width,
+                kCVPixelBufferHeightKey: panel.height,
+                kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ]
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &scalePool)
+        }
+        guard let pool = scalePool else { return image }
+        var dstOpt: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dstOpt) == kCVReturnSuccess, let dst = dstOpt else { return image }
+        let input = CIImage(cvPixelBuffer: image, options: [.colorSpace: NSNull()]).clampedToExtent()
+        guard let filter = CIFilter(name: "CIBicubicScaleTransform") else { return image }
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(Double(panel.width) / Double(max(1, srcW)), forKey: kCIInputScaleKey)
+        filter.setValue((Double(panel.height) / Double(max(1, srcH))) / (Double(panel.width) / Double(max(1, srcW))), forKey: "inputAspectRatio")
+        filter.setValue(1.0 / 3.0, forKey: "inputB")
+        filter.setValue(1.0 / 3.0, forKey: "inputC")
+        guard let output = filter.outputImage?.cropped(to: CGRect(x: 0, y: 0, width: panel.width, height: panel.height)) else {
+            return image
+        }
+        ciContext.render(output, to: dst, bounds: CGRect(x: 0, y: 0, width: panel.width, height: panel.height), colorSpace: nil)
+        if let srgbSpace {
+            CVBufferSetAttachment(dst, kCVImageBufferCGColorSpaceKey, srgbSpace, .shouldPropagate)
+        }
+        return dst
+    }
+
     @discardableResult
     private func submitFrame(_ image: CVImageBuffer, pts: CMTime, forceAdmission: Bool) -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
@@ -345,8 +449,9 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         let properties = needsKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary : nil
         needsKeyframe = false
         lock.unlock()
+        let encodeImage = scaledBuffer(image)
         let status = VTCompressionSessionEncodeFrame(
-            encoder, imageBuffer: image, presentationTimeStamp: pts,
+            encoder, imageBuffer: encodeImage, presentationTimeStamp: pts,
             duration: .invalid, frameProperties: properties, infoFlagsOut: nil
         ) { [weak self] status, _, output in self?.encoded(status: status, sample: output) }
         if status != noErr { finishEncode(failed: true) }
@@ -433,6 +538,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         stopped = true
         lastImage = nil
         lock.unlock()
+        modeTask?.cancel(); modeTask = nil
         refineTimer?.cancel(); refineTimer = nil
         input?.cancel()
         input = nil
@@ -440,6 +546,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         if let encoder = encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
+        if let scalePool { CVPixelBufferPoolFlush(scalePool, .excessBuffers) }
+        scalePool = nil
         display = nil
         if sleepAssertion != 0 {
             IOPMAssertionRelease(sleepAssertion)

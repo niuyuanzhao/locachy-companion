@@ -226,7 +226,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate 
             let session = try Sender(endpoint: endpoint, key: key)
             key.resetBytes(in: 0..<key.count)
             session.onActive = { [weak self] in
-                self?.status.stringValue = "Connected."
+                self?.status.stringValue = "Connected. Scaled resolutions are available in System Settings → Displays."
                 self?.window.orderOut(nil)
                 NSApplication.shared.setActivationPolicy(.accessory)
             }
