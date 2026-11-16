@@ -88,10 +88,12 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 try await Task.sleep(for: .milliseconds(50))
             }
             guard CGDisplayIsInMirrorSet(id) != 1 else { throw SenderError("macOS placed the LOCachy display in a mirror set") }
-            let width = CGDisplayPixelsWide(id), height = CGDisplayPixelsHigh(id)
-            guard width == plan.requested.pixelsWide, height == plan.requested.pixelsHigh else {
+            guard let cur = CGDisplayCopyDisplayMode(id),
+                  cur.width == plan.requested.pointsWide, cur.height == plan.requested.pointsHigh,
+                  cur.pixelWidth == plan.requested.pixelsWide, cur.pixelHeight == plan.requested.pixelsHigh else {
                 throw SenderError("Virtual display did not enter the requested 1:1 mode")
             }
+            let width = cur.pixelWidth, height = cur.pixelHeight
             let target = try await shareable(id)
             try Task.checkCancellation()
             try configureEncoder(width: width, height: height)
