@@ -85,10 +85,12 @@ struct Panel: Equatable {
         let panel = hello["panel"] as? [String: Any] ?? hello
         width = try Wire.integer(panel, panel["width"] == nil ? "pixelsWide" : "width", 64...4096)
         height = try Wire.integer(panel, panel["height"] == nil ? "pixelsHigh" : "height", 64...4096)
-        _ = try Wire.number(panel, "scale", 0.5...4)
-        // High density displays (e.g. 2160x1440, 1920x1080+, 2K/3K/4K) always
-        // create a HiDPI (@2x) virtual display with multi-step fractional scale modes.
-        scale = (width >= 1600 || height >= 1000) ? 2 : 1
+        let requestedScale = try Wire.number(panel, "scale", 0.5...4)
+        // Compute virtual display geometry strictly from the receiver hello:
+        // use HiDPI @2x when @2x produces exact even points (1:1 physical pixels)
+        // and the receiver asked for >= 2x or has a high-density panel.
+        let exactHiDPI = width % 4 == 0 && height % 4 == 0
+        scale = (exactHiDPI && (requestedScale >= 2 || width >= 1600 || height >= 1000)) ? 2 : 1
         // VirtualCanvasSizing rounds to even points; capture verifies the
         // resulting mode and the receiver reads the real size from the SPS.
         guard width * height <= 16 * 1024 * 1024 else { throw SenderError("Panel is too large") }

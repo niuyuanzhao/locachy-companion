@@ -65,6 +65,19 @@ enum ProtocolTests {
         } catch {
             check(false, "accepts the exact receiver hello: \(error)")
         }
+        do {
+            let native = try hello(receiverHello
+                .replacingOccurrences(of: "\"width\":1920,\"height\":1200,\"scale\":2.000", with: "\"width\":2160,\"height\":1440,\"scale\":1.000")
+                .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":2160,\"pixelsHigh\":1440"))
+            check(native.width == 2160 && native.height == 1440 && native.scale == 2,
+                  "computes exact 1:1 HiDPI geometry from a 2160x1440 handshake")
+            let odd = try hello(receiverHello
+                .replacingOccurrences(of: "\"width\":1920,\"height\":1200,\"scale\":2.000", with: "\"width\":2562,\"height\":1442,\"scale\":2.000")
+                .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":2562,\"pixelsHigh\":1442"))
+            check(odd.scale == 1, "falls back to 1x when 2x points would round physical dimensions")
+        } catch {
+            check(false, "computes exact geometry from handshake: \(error)")
+        }
         expectThrow("rejects HEVC-only receivers") {
             _ = try hello(receiverHello.replacingOccurrences(of: "\"codec\":\"h264\"", with: "\"codec\":\"hevc\""))
         }

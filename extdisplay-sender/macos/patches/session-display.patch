@@ -1,80 +1,6 @@
 --- a/Mac/VirtualDisplay.swift
 +++ b/Mac/VirtualDisplay.swift
-@@ -40,6 +40,26 @@
-     /// `restoreOrigin` overrides that saved arrangement (see manageOrigin);
-     /// `onOriginChange` reports where the display sits afterwards, so the
-     /// caller can persist user drags.
-+    static func scaledModes(pointsWide: Int, pointsHigh: Int, scale: Int, maxPixelsPerAxis: Int) -> [CGVirtualDisplayMode] {
-+        let nativeW = pointsWide * scale
-+        let nativeH = pointsHigh * scale
-+        let divisors: [Double] = scale == 2 ? [2.0, 1.75, 1.5, 1.25, 1.0] : [1.0]
-+        var seen = Set<String>()
-+        var list: [CGVirtualDisplayMode] = []
-+        for d in divisors {
-+            let w = max(2, Int((Double(nativeW) / d).rounded()) & ~1)
-+            let h = max(2, Int((Double(nativeH) / d).rounded()) & ~1)
-+            guard w * scale <= maxPixelsPerAxis, h * scale <= maxPixelsPerAxis else { continue }
-+            let key = "\(w)x\(h)"
-+            if seen.insert(key).inserted {
-+                list.append(CGVirtualDisplayMode(width: UInt(w), height: UInt(h), refreshRate: 60))
-+            }
-+        }
-+        if list.isEmpty {
-+            list.append(CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60))
-+        }
-+        return list
-+    }
-     init?(name: String, pointsWide: Int, pointsHigh: Int, scale: Int = 2,
-           descriptorMaxPixelsPerAxis: Int, sizeInMillimeters: CGSize,
-           serialNum: UInt32 = 0x0001, productID: UInt32 = 0x4F53,
-@@ -86,30 +106,11 @@
-             return nil
-         }
-         Log.info("virtual display created: id=\(display.displayID) \(pointsWide)x\(pointsHigh)pt @\(self.scale)x")
--
--        // macOS defaults the new display to its 1x mode AND can restore a
--        // stale saved mode for this serial asynchronously, seconds after the
--        // display appears (observed: a display checked as @2x at creation
--        // sitting at 1x later, and a rotated rebuild pillarboxed by the
--        // previous orientation's mode). So mode selection is enforcement,
--        // not a one-shot: keep watching for the lifetime of the display and
--        // re-assert the HiDPI mode whenever something else changes it. A 1x
--        // display is enforced the same way, against its 1x mode.
--        Task { @MainActor [weak self] in
--            var settled = false
--            while true {
--                // Scoped strong ref: a rotation rebuild relies on release
--                // removing the display — never hold it across the sleep.
--                do {
--                    guard let self else { return }
--                    if self.resizesInFlight == 0 {
--                        self.ensureNotMirrored()
--                        if self.selectTargetMode(recover: settled) { settled = true }
--                        self.manageOrigin()
--                    }
--                }
--                try? await Task.sleep(for: .milliseconds(settled ? 2000 : 200))
--            }
-+        ensureNotMirrored()
-+        let fullModes = Self.scaledModes(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: self.scale, maxPixelsPerAxis: maxPixelsPerAxis)
-+        if fullModes.count > 1 {
-+            settings.modes = fullModes
-+            _ = display.apply(settings)
-         }
-     }
- 
-@@ -135,9 +136,7 @@
- 
-         let newSettings = CGVirtualDisplaySettings()
-         newSettings.hiDPI = scale == 2 ? 1 : 0
--        newSettings.modes = [
--            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60)
--        ]
-+        newSettings.modes = Self.scaledModes(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale, maxPixelsPerAxis: maxPixelsPerAxis)
-         // The enforcement tick must not run between the new mode and its
-         // placement: it would re-apply the old origin target, or report
-         // WindowServer's own placement as a user drag. A count, so a resize
-@@ -183,7 +182,7 @@
+@@ -183,7 +183,7 @@
              var config: CGDisplayConfigRef?
              guard CGBeginDisplayConfiguration(&config) == .success else { return true }
              CGConfigureDisplayOrigin(config, display.displayID, Int32(origin.x), Int32(origin.y))
@@ -83,7 +9,7 @@
              outcome = "moved from (\(Int(settled.x)),\(Int(settled.y))) (result \(err.rawValue))"
              settled = CGDisplayBounds(display.displayID).origin
          }
-@@ -256,7 +255,7 @@
+@@ -256,7 +256,7 @@
          var config: CGDisplayConfigRef?
          CGBeginDisplayConfiguration(&config)
          CGConfigureDisplayWithDisplayMode(config, display.displayID, hidpi, nil)
@@ -92,7 +18,7 @@
          if err == .success {
              hidpiRefusals = 0
              Log.info("display mode (re)selected: \(hidpi.width)x\(hidpi.height)@\(scale)x (result 0)")
-@@ -302,7 +301,7 @@
+@@ -302,7 +302,7 @@
              var config: CGDisplayConfigRef?
              guard CGBeginDisplayConfiguration(&config) == .success else { return }
              CGConfigureDisplayOrigin(config, id, Int32(target.x), Int32(target.y))
@@ -101,7 +27,7 @@
              let settled = CGDisplayBounds(id).origin
              originRestore.settled(at: settled)
              Log.info("display \(id) origin (\(Int(origin.x)),\(Int(origin.y))) → restored "
-@@ -334,15 +333,8 @@
+@@ -334,15 +334,8 @@
          // Detach the virtual display itself (covers "macOS mirrors the VD onto
          // the main display")...
          CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay)

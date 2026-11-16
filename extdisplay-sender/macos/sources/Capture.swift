@@ -21,7 +21,6 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var input: RemoteInput?
-    private var modeTask: Task<Void, Never>?
     private var refineTimer: DispatchSourceTimer?
     private var lastImage: CVImageBuffer?
     private var stopped = false
@@ -32,26 +31,6 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var activeCodec = "h264"
     private var recovering = false
     private var sleepAssertion: IOPMAssertionID = 0
-
-    private func loadPreferredMode(defaultPoints: CGSize, defaultPixels: CGSize) -> (points: CGSize, pixels: CGSize) {
-        let d = UserDefaults.standard
-        let pw = d.integer(forKey: "locachy.display.pointsWide")
-        let ph = d.integer(forKey: "locachy.display.pointsHigh")
-        let xw = d.integer(forKey: "locachy.display.pixelsWide")
-        let xh = d.integer(forKey: "locachy.display.pixelsHigh")
-        if pw > 0, ph > 0, xw > 0, xh > 0 {
-            return (CGSize(width: pw, height: ph), CGSize(width: xw, height: xh))
-        }
-        return (defaultPoints, defaultPixels)
-    }
-
-    private func savePreferredMode(pointsWide: Int, pointsHigh: Int, pixelsWide: Int, pixelsHigh: Int) {
-        let d = UserDefaults.standard
-        d.set(pointsWide, forKey: "locachy.display.pointsWide")
-        d.set(pointsHigh, forKey: "locachy.display.pointsHigh")
-        d.set(pixelsWide, forKey: "locachy.display.pixelsWide")
-        d.set(pixelsHigh, forKey: "locachy.display.pixelsHigh")
-    }
 
     init(transport: SecureTransport, panel: Panel) {
         self.transport = transport
@@ -98,19 +77,22 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                     throw SenderError("macOS rejected the receiver resolution")
                 }
             }
-            let preferred = loadPreferredMode(
-                defaultPoints: CGSize(width: plan.requested.pointsWide, height: plan.requested.pointsHigh),
-                defaultPixels: CGSize(width: plan.requested.pixelsWide, height: plan.requested.pixelsHigh))
-            for _ in 0..<8 {
-                selectNativeMode(id: id, pointsWide: Int(preferred.points.width), pointsHigh: Int(preferred.points.height),
-                                 pixelsWide: Int(preferred.pixels.width), pixelsHigh: Int(preferred.pixels.height))
+            for _ in 0..<20 {
+                selectNativeMode(id: id, pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
+                                 pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
+                if let cur = CGDisplayCopyDisplayMode(id),
+                   cur.width == plan.requested.pointsWide, cur.height == plan.requested.pointsHigh,
+                   cur.pixelWidth == plan.requested.pixelsWide, cur.pixelHeight == plan.requested.pixelsHigh {
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(50))
             }
-            let curMode = CGDisplayCopyDisplayMode(id)
-            let target = try await shareable(id)
-            try Task.checkCancellation()
             guard CGDisplayIsInMirrorSet(id) != 1 else { throw SenderError("macOS placed the LOCachy display in a mirror set") }
-            let width = panel.width, height = panel.height
+            let width = CGDisplayPixelsWide(id), height = CGDisplayPixelsHigh(id)
+            guard width == plan.requested.pixelsWide, height == plan.requested.pixelsHigh else {
+                throw SenderError("Virtual display did not enter the requested 1:1 mode")
+            }
+            let target = try await shareable(id)
             try Task.checkCancellation()
             try configureEncoder(width: width, height: height)
             input = RemoteInput(displayID: id)
@@ -123,9 +105,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                                   "height": height, "framesPerSecond": panel.fps])
             try await capture.startCapture()
             try Task.checkCancellation()
-            startModeWatcher(id: id, initialSize: CGSize(width: curMode?.width ?? target.width, height: curMode?.height ?? target.height),
-                             initialPixels: CGSize(width: curMode?.pixelWidth ?? width, height: curMode?.pixelHeight ?? height))
-            SenderLog.info("Extended display \(id) is active at \(width)x\(height) (\(activeCodec))")
+            SenderLog.info("Extended display \(id) is active at \(plan.requested.pointsWide)x\(plan.requested.pointsHigh) @\(plan.requested.scale)x (\(width)x\(height), \(activeCodec))")
         } catch {
             stop("Capture setup failed")
             throw error
@@ -206,35 +186,6 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     @MainActor
-    private func startModeWatcher(id: CGDirectDisplayID, initialSize: CGSize, initialPixels: CGSize) {
-        var lastSize = initialSize
-        var lastPixels = initialPixels
-        modeTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(250))
-                guard let self, !self.stopped,
-                      let m = CGDisplayCopyDisplayMode(id) else { continue }
-                if m.width == self.panel.width, m.height == self.panel.height, m.pixelWidth > self.panel.width {
-                    self.selectNativeMode(id: id, pointsWide: self.panel.width, pointsHigh: self.panel.height,
-                                          pixelsWide: self.panel.width, pixelsHigh: self.panel.height)
-                    self.savePreferredMode(pointsWide: self.panel.width, pointsHigh: self.panel.height,
-                                           pixelsWide: self.panel.width, pixelsHigh: self.panel.height)
-                    continue
-                }
-                let size = CGSize(width: m.width, height: m.height)
-                let pixels = CGSize(width: m.pixelWidth, height: m.pixelHeight)
-                guard size.width > 0, size.height > 0, (size != lastSize || pixels != lastPixels) else { continue }
-                lastSize = size
-                lastPixels = pixels
-                self.savePreferredMode(pointsWide: m.width, pointsHigh: m.height,
-                                       pixelsWide: m.pixelWidth, pixelsHigh: m.pixelHeight)
-                await self.rebuildStream(id: id)
-                SenderLog.info("Updated capture filter for scaled mode \(m.width)x\(m.height) (px=\(m.pixelWidth)x\(m.pixelHeight))")
-            }
-        }
-    }
-
-    @MainActor
     private func shareable(_ id: CGDirectDisplayID) async throws -> SCDisplay {
         for _ in 0..<40 {
             let displays = try await SCShareableContent.current.displays
@@ -278,6 +229,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 60 as CFNumber)
@@ -314,6 +266,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         guard status == noErr, let created else { throw SenderError("VideoToolbox encoder is unavailable") }
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
@@ -340,17 +293,24 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
            status != .complete && status != .started {
             return
         }
-        lock.lock()
-        lastImage = image
-        lock.unlock()
-        scheduleRefinement()
-        submitFrame(image, pts: CMSampleBufferGetPresentationTimeStamp(sample), forceAdmission: false)
+        if submitFrame(image, pts: CMSampleBufferGetPresentationTimeStamp(sample), forceAdmission: false) {
+            refineTimer?.cancel()
+            refineTimer = nil
+            lock.lock()
+            lastImage = nil
+            lock.unlock()
+        } else {
+            lock.lock()
+            lastImage = image
+            lock.unlock()
+            scheduleRefinement()
+        }
     }
 
     private func scheduleRefinement() {
         refineTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
-        timer.schedule(deadline: .now() + .milliseconds(120))
+        timer.schedule(deadline: .now() + .milliseconds(30))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.lock.lock()
@@ -360,17 +320,24 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             self.refineTimer?.cancel()
             self.refineTimer = nil
             guard !ended, let image else { return }
-            self.submitFrame(image, pts: CMClockGetTime(CMClockGetHostTimeClock()), forceAdmission: false)
+            if self.submitFrame(image, pts: CMClockGetTime(CMClockGetHostTimeClock()), forceAdmission: true) {
+                self.lock.lock()
+                self.lastImage = nil
+                self.lock.unlock()
+            } else {
+                self.scheduleRefinement()
+            }
         }
         timer.resume()
         refineTimer = timer
     }
 
-    private func submitFrame(_ image: CVImageBuffer, pts: CMTime, forceAdmission: Bool) {
+    @discardableResult
+    private func submitFrame(_ image: CVImageBuffer, pts: CMTime, forceAdmission: Bool) -> Bool {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         guard !stopped, !encoding, transport.canAcceptVideo, let encoder,
-              forceAdmission || now - lastSubmit >= 0.95 / Double(panel.fps) else { lock.unlock(); return }
+              forceAdmission || now - lastSubmit >= 0.80 / Double(panel.fps) else { lock.unlock(); return false }
         encoding = true
         lastSubmit = now
         let properties = needsKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary : nil
@@ -381,6 +348,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             duration: .invalid, frameProperties: properties, infoFlagsOut: nil
         ) { [weak self] status, _, output in self?.encoded(status: status, sample: output) }
         if status != noErr { finishEncode(failed: true) }
+        return true
     }
 
     private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
@@ -463,7 +431,6 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         stopped = true
         lastImage = nil
         lock.unlock()
-        modeTask?.cancel(); modeTask = nil
         refineTimer?.cancel(); refineTimer = nil
         input?.cancel()
         input = nil
