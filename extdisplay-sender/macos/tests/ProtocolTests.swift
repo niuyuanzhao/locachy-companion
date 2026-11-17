@@ -66,6 +66,17 @@ enum ProtocolTests {
             check(false, "accepts the exact receiver hello: \(error)")
         }
         do {
+            let named = try hello(receiverHello
+                .replacingOccurrences(of: "\"device\":\"LOCachy\"", with: "\"device\":\"LOCachy\",\"host\":\"cf-fv1\",\"model\":\"CF-FV1RFAAS\""))
+            check(named.identityKey == "host=cf-fv1|model=CF-FV1RFAAS|panel=1920x1200",
+                  "keys receiver identity by sanitized host, model, and panel dimensions")
+            let fallback = try hello(receiverHello)
+            check(fallback.identityKey == "device=LOCachy|panel=1920x1200",
+                  "falls back to device and panel dimensions when host/model are absent")
+        } catch {
+            check(false, "receiver identity keying: \(error)")
+        }
+        do {
             let native = try hello(receiverHello
                 .replacingOccurrences(of: "\"width\":1920,\"height\":1200,\"scale\":2.000", with: "\"width\":2160,\"height\":1440,\"scale\":1.000")
                 .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":2160,\"pixelsHigh\":1440"))

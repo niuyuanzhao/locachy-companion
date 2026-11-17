@@ -106,6 +106,7 @@ TARGET="$(uname -m)-apple-macos13.0"
     "$GENERATED/Mac/VirtualDisplay.swift" \
     "$ROOT/sources/UpstreamLog.swift" \
     "$ROOT/sources/Wire.swift" \
+    "$ROOT/sources/DisplayModeDB.swift" \
     "$ROOT/sources/PairingCode.swift" \
     "$ROOT/sources/SecureTransport.swift" \
     "$ROOT/sources/Input.swift" \
@@ -130,8 +131,8 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>org.locachy.extdisplay.sender</string>
 <key>CFBundleName</key><string>LOCachy Extended Display</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.4.4</string>
-<key>CFBundleVersion</key><string>0.4.4</string>
+<key>CFBundleShortVersionString</key><string>0.4.5</string>
+<key>CFBundleVersion</key><string>0.4.5</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Discover and connect to the LOCachy extended display over a dedicated Thunderbolt or USB4 link.</string>

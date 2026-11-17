@@ -74,6 +74,33 @@ struct Panel: Equatable {
     let scale: Int
     let fps: Int
     let codec: String
+    let deviceName: String
+    let hostName: String
+    let machineModel: String
+
+    var identityKey: String {
+        if !hostName.isEmpty || !machineModel.isEmpty {
+            return "host=\(hostName)|model=\(machineModel)|panel=\(width)x\(height)"
+        }
+        return "device=\(deviceName)|panel=\(width)x\(height)"
+    }
+
+    private static func sanitizeLabel(_ raw: String?) -> String {
+        guard let raw else { return "" }
+        var out = ""
+        var prevSpace = false
+        for scalar in raw.unicodeScalars {
+            guard scalar.value >= 0x20, scalar.value <= 0x7e, scalar != "|", scalar != "\"", scalar != "\\" else { continue }
+            if scalar == " " {
+                if !out.isEmpty && !prevSpace { out.append(" "); prevSpace = true }
+            } else {
+                out.append(Character(scalar))
+                prevSpace = false
+            }
+            if out.count >= 64 { break }
+        }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
 
     init(hello: [String: Any]) throws {
         guard hello["type"] as? String == "hello", try Wire.integer(hello, "locachy", 1...1) == 1,
@@ -82,6 +109,10 @@ struct Panel: Equatable {
               let input = hello["input"] as? [String], Set(Wire.capabilities).isSubset(of: Set(input)),
               let caps = hello["videoCaps"] as? [[String: Any]], !caps.isEmpty, caps.count <= 16
         else { throw SenderError("Receiver does not support the authenticated extended-display profile") }
+        let device = Self.sanitizeLabel(hello["device"] as? String)
+        deviceName = device.isEmpty ? "LOCachy" : device
+        hostName = Self.sanitizeLabel(hello["host"] as? String)
+        machineModel = Self.sanitizeLabel(hello["model"] as? String)
         let panel = hello["panel"] as? [String: Any] ?? hello
         width = try Wire.integer(panel, panel["width"] == nil ? "pixelsWide" : "width", 64...4096)
         height = try Wire.integer(panel, panel["height"] == nil ? "pixelsHigh" : "height", 64...4096)

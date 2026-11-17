@@ -36,6 +36,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var captureWidth = 0
     private var captureHeight = 0
     private var sleepAssertion: IOPMAssertionID = 0
+    private var wakeAssertion: IOPMAssertionID = 0
     private lazy var ciContext: CIContext? = {
         guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         return CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
@@ -52,8 +53,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor
     func start() async throws {
         try Task.checkCancellation()
-        var wakeID: IOPMAssertionID = 0
-        IOPMAssertionDeclareUserActivity("LOCachy Extended Display" as CFString, kIOPMUserActiveLocal, &wakeID)
+        IOPMAssertionDeclareUserActivity("LOCachy Extended Display" as CFString, kIOPMUserActiveLocal, &wakeAssertion)
         _ = IOPMAssertionCreateWithName(
             kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
@@ -88,22 +88,47 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                     throw SenderError("macOS rejected the receiver resolution")
                 }
             }
+            let allowedModes = VirtualDisplay.scaledModes(
+                pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
+                scale: plan.requested.scale, maxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis)
+            let allowedPointSizes = allowedModes.map { (Int($0.width), Int($0.height)) }
+            let defaultTarget = SavedDisplayMode(
+                pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
+                pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
+            var targetMode = DisplayModeDB.shared.lookup(for: panel, allowedPointSizes: allowedPointSizes) ?? defaultTarget
             for _ in 0..<20 {
-                selectNativeMode(id: id, pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
-                                 pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
+                selectNativeMode(id: id, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
+                                 pixelsWide: targetMode.pixelsWide, pixelsHigh: targetMode.pixelsHigh)
                 if let cur = CGDisplayCopyDisplayMode(id),
-                   cur.width == plan.requested.pointsWide, cur.height == plan.requested.pointsHigh,
-                   cur.pixelWidth == plan.requested.pixelsWide, cur.pixelHeight == plan.requested.pixelsHigh {
+                   cur.width == targetMode.pointsWide, cur.height == targetMode.pointsHigh,
+                   (cur.pixelWidth == targetMode.pixelsWide && cur.pixelHeight == targetMode.pixelsHigh
+                    || targetMode.pointsWide == panel.width) {
                     break
                 }
                 try await Task.sleep(for: .milliseconds(50))
             }
+            if let cur = CGDisplayCopyDisplayMode(id),
+               cur.width != targetMode.pointsWide || cur.height != targetMode.pointsHigh,
+               targetMode != defaultTarget {
+                targetMode = defaultTarget
+                for _ in 0..<20 {
+                    selectNativeMode(id: id, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
+                                     pixelsWide: targetMode.pixelsWide, pixelsHigh: targetMode.pixelsHigh)
+                    if let updated = CGDisplayCopyDisplayMode(id),
+                       updated.width == targetMode.pointsWide, updated.height == targetMode.pointsHigh {
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+            }
             guard CGDisplayIsInMirrorSet(id) != 1 else { throw SenderError("macOS placed the LOCachy display in a mirror set") }
             guard let cur = CGDisplayCopyDisplayMode(id),
-                  cur.width == plan.requested.pointsWide, cur.height == plan.requested.pointsHigh,
-                  cur.pixelWidth == plan.requested.pixelsWide, cur.pixelHeight == plan.requested.pixelsHigh else {
-                throw SenderError("Virtual display did not enter the requested 1:1 mode")
+                  cur.width == targetMode.pointsWide, cur.height == targetMode.pointsHigh else {
+                throw SenderError("Virtual display did not enter the requested display mode")
             }
+            let activeMode = SavedDisplayMode(
+                pointsWide: cur.width, pointsHigh: cur.height,
+                pixelsWide: cur.pixelWidth, pixelsHigh: cur.pixelHeight)
             let width = panel.width, height = panel.height
             let capW = cur.pixelWidth, capH = cur.pixelHeight
             captureWidth = capW
@@ -121,8 +146,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                                   "height": height, "framesPerSecond": panel.fps])
             try await capture.startCapture()
             try Task.checkCancellation()
-            startModeWatcher(id: id, requested: plan.requested)
-            SenderLog.info("Extended display \(id) is active at \(plan.requested.pointsWide)x\(plan.requested.pointsHigh) @\(plan.requested.scale)x (\(width)x\(height), \(activeCodec))")
+            startModeWatcher(id: id, initialTarget: activeMode, allowedPointSizes: allowedPointSizes)
+            SenderLog.info("Extended display \(id) is active at \(activeMode.pointsWide)x\(activeMode.pointsHigh) (cap=\(capW)x\(capH), out=\(width)x\(height), \(activeCodec), \(panel.identityKey))")
         } catch {
             stop("Capture setup failed")
             throw error
@@ -208,12 +233,12 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     @MainActor
-    private func startModeWatcher(id: CGDirectDisplayID, requested: VirtualCanvasSize) {
+    private func startModeWatcher(id: CGDirectDisplayID, initialTarget: SavedDisplayMode, allowedPointSizes: [(Int, Int)]) {
         let settleUntil = ProcessInfo.processInfo.systemUptime + 2.0
-        var lastSize = CGSize(width: requested.pointsWide, height: requested.pointsHigh)
-        var lastPixels = CGSize(width: requested.pixelsWide, height: requested.pixelsHigh)
+        var lastSize = CGSize(width: initialTarget.pointsWide, height: initialTarget.pointsHigh)
+        var lastPixels = CGSize(width: initialTarget.pixelsWide, height: initialTarget.pixelsHigh)
         var correctedDuringSettle = false
-        var tried1xPanel = false
+        var tried1xPanel = initialTarget.pointsWide == panel.width && initialTarget.pointsHigh == panel.height
         modeTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
@@ -221,18 +246,22 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                       var m = CGDisplayCopyDisplayMode(id) else { continue }
                 let now = ProcessInfo.processInfo.systemUptime
                 if now < settleUntil {
-                    if m.width != requested.pointsWide || m.height != requested.pointsHigh ||
-                       m.pixelWidth != requested.pixelsWide || m.pixelHeight != requested.pixelsHigh {
+                    if m.width != initialTarget.pointsWide || m.height != initialTarget.pointsHigh ||
+                       (initialTarget.pointsWide != self.panel.width &&
+                        (m.pixelWidth != initialTarget.pixelsWide || m.pixelHeight != initialTarget.pixelsHigh)) {
                         correctedDuringSettle = true
-                        self.selectNativeMode(id: id, pointsWide: requested.pointsWide, pointsHigh: requested.pointsHigh,
-                                              pixelsWide: requested.pixelsWide, pixelsHigh: requested.pixelsHigh)
+                        self.selectNativeMode(id: id, pointsWide: initialTarget.pointsWide, pointsHigh: initialTarget.pointsHigh,
+                                              pixelsWide: initialTarget.pixelsWide, pixelsHigh: initialTarget.pixelsHigh)
                     }
                     continue
                 }
                 if correctedDuringSettle {
                     correctedDuringSettle = false
-                    if m.width == requested.pointsWide, m.height == requested.pointsHigh,
-                       m.pixelWidth == requested.pixelsWide, m.pixelHeight == requested.pixelsHigh {
+                    if m.width == initialTarget.pointsWide, m.height == initialTarget.pointsHigh,
+                       (m.pixelWidth != Int(lastPixels.width) || m.pixelHeight != Int(lastPixels.height)) {
+                        lastSize = CGSize(width: m.width, height: m.height)
+                        lastPixels = CGSize(width: m.pixelWidth, height: m.pixelHeight)
+                        self.input?.invalidateDisplayCache()
                         await self.rebuildStream(id: id, sourceWidth: m.pixelWidth, sourceHeight: m.pixelHeight)
                     }
                 }
@@ -253,6 +282,10 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 lastPixels = pixels
                 self.input?.invalidateDisplayCache()
                 await self.rebuildStream(id: id, sourceWidth: m.pixelWidth, sourceHeight: m.pixelHeight)
+                let chosen = SavedDisplayMode(
+                    pointsWide: m.width, pointsHigh: m.height,
+                    pixelsWide: m.pixelWidth, pixelsHigh: m.pixelHeight)
+                DisplayModeDB.shared.save(for: self.panel, mode: chosen, allowedPointSizes: allowedPointSizes)
                 SenderLog.info("Updated capture stream for scaled mode \(m.width)x\(m.height) (px=\(m.pixelWidth)x\(m.pixelHeight))")
             }
         }

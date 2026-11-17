@@ -27,6 +27,7 @@ xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos
     -framework CoreGraphics -framework CoreImage -framework CoreVideo \
     "$OUT/generated/Mac/OriginRestore.swift" "$OUT/generated/Mac/VirtualCanvasSizing.swift" \
     "$OUT/generated/Mac/VirtualDisplay.swift" "$HERE/sources/UpstreamLog.swift" \
+    "$HERE/sources/Wire.swift" "$HERE/sources/DisplayModeDB.swift" \
     "$HERE/tests/DisplayModeTests.swift" -o "$OUT/tests/display-mode-tests"
 "$OUT/tests/display-mode-tests"
 

@@ -108,9 +108,39 @@ enum DisplayModeTests {
         check(cornerR == 33, "clamped extent avoids dark border bleed at frame edges (corner=\(cornerR))")
     }
 
+    static func testModeDB() {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("locachy-mode-db-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let db = DisplayModeDB(fileURL: tmp)
+        let baseHello = """
+        {"type":"hello","pv":3,"locachy":1,"device":"LOCachy","host":"cf-fv1","model":"CF-FV1","pixelsWide":2160,"pixelsHigh":1440,"scale":2.0,"panel":{"width":2160,"height":1440,"scale":2.0},"displayMaxFrameRate":60,"extendedOnly":true,"videoCaps":[{"codec":"h264","maxWidth":4096,"maxHeight":4096,"maxFramesPerSecond":60}],"input":["key","button","cancel","pointer","scroll"]}
+        """
+        guard let fv1 = try? Panel(hello: Wire.object(Data(baseHello.utf8))),
+              let x230 = try? Panel(hello: Wire.object(Data(baseHello.replacingOccurrences(of: "\"host\":\"cf-fv1\",\"model\":\"CF-FV1\"", with: "\"host\":\"x230\",\"model\":\"2325\"").utf8))) else {
+            check(false, "parses named receiver hellos for DisplayModeDB tests")
+            return
+        }
+        let allowed = VirtualDisplay.scaledModes(pointsWide: 1080, pointsHigh: 720, scale: 2, maxPixelsPerAxis: 8192)
+            .map { (Int($0.width), Int($0.height)) }
+        check(db.lookup(for: fv1, allowedPointSizes: allowed) == nil,
+              "returns nil for an unseen receiver (defaults to 1:1)")
+        let chosen = SavedDisplayMode(pointsWide: 1440, pointsHigh: 960, pixelsWide: 2880, pixelsHigh: 1920)
+        db.save(for: fv1, mode: chosen, allowedPointSizes: allowed)
+        let dbReloaded = DisplayModeDB(fileURL: tmp)
+        check(dbReloaded.lookup(for: fv1, allowedPointSizes: allowed) == chosen,
+              "persists and restores chosen scaling mode by host, model, and panel")
+        check(dbReloaded.lookup(for: x230, allowedPointSizes: allowed) == nil,
+              "keeps scaling choices isolated across different host/model receivers")
+        let bogus = SavedDisplayMode(pointsWide: 1235, pointsHigh: 823, pixelsWide: 2470, pixelsHigh: 1646)
+        dbReloaded.save(for: x230, mode: bogus, allowedPointSizes: allowed)
+        check(dbReloaded.lookup(for: x230, allowedPointSizes: allowed) == nil,
+              "rejects invalid scaling modes outside allowedModes")
+    }
+
     static func main() {
         testScaledModes()
         testMitchellScaling()
+        testModeDB()
         if failures != 0 {
             print("FAIL: \(failures) display mode test(s)")
             exit(1)

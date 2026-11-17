@@ -108,10 +108,13 @@ final class Sender {
         Task { @MainActor in
             // Do not let a suspended startCapture create a stream after cleanup.
             await pendingStart?.value
-            self.capture?.stop(reason)
-            self.capture = nil
+            if let capture = self.capture {
+                capture.stop(reason)
+                self.capture = nil
+            } else {
+                SenderLog.info(reason)
+            }
             self.transport.stop(reason)
-            SenderLog.info(reason)
             // The same cleanup serves both GUI retry and the one-shot CLI.
             try? await Task.sleep(for: .milliseconds(250))
             self.onEnd?(reason, code)
