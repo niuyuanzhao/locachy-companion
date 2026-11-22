@@ -1,33 +1,125 @@
 --- a/Mac/VirtualDisplay.swift
 +++ b/Mac/VirtualDisplay.swift
-@@ -40,6 +40,26 @@
+@@ -40,9 +40,118 @@
      /// `restoreOrigin` overrides that saved arrangement (see manageOrigin);
      /// `onOriginChange` reports where the display sits afterwards, so the
      /// caller can persist user drags.
-+    static func scaledModes(pointsWide: Int, pointsHigh: Int, scale: Int, maxPixelsPerAxis: Int) -> [CGVirtualDisplayMode] {
-+        let nativeW = pointsWide * scale
-+        let nativeH = pointsHigh * scale
-+        let divisors: [Double] = scale == 2 ? [2.0, 1.75, 1.5, 1.25, 1.0] : [1.0]
++    private static func even(_ value: Double) -> Int {
++        max(2, Int((value / 2.0).rounded()) * 2)
++    }
++
++    private static func evenFloor(_ value: Double) -> Int {
++        max(2, Int(floor(value)) & ~1)
++    }
++
++    private static func evenCeil(_ value: Double) -> Int {
++        max(2, (Int(ceil(value)) + 1) & ~1)
++    }
++
++    static func scaledModes(panelWide: Int, panelHigh: Int, scale: Int, maxPixelsPerAxis: Int) -> [CGVirtualDisplayMode] {
++        let clampedScale = scale < 2 ? 1 : 2
++        let maxLogical = max(2, evenFloor(Double(maxPixelsPerAxis) / Double(clampedScale)))
++        let aspect = Double(max(2, panelWide)) / Double(max(2, panelHigh))
++        let maxHAllowed = min(maxLogical, evenFloor(Double(maxLogical) / aspect))
++        let nativeH = min(even(Double(panelHigh)), maxHAllowed)
++        let nativeW = min(even(Double(panelWide)), maxLogical)
++
++        if clampedScale == 1 {
++            return [CGVirtualDisplayMode(width: UInt(nativeW), height: UInt(nativeH), refreshRate: 60)]
++        }
++
++        let isHighRes = min(panelWide, panelHigh) >= 1296
++        var minH: Int
++        var maxH: Int
++        if isHighRes {
++            minH = even(Double(panelHigh) / 2.0)
++            maxH = even(Double(panelHigh))
++        } else {
++            // Keep every thumbnail step >= 648pt on both axes so macOS Display
++            // Settings retains all steps.
++            let minHForWidth = aspect < 1.0 ? evenCeil(648.0 / aspect) : 648
++            minH = max(648, minHForWidth)
++            while even(Double(minH) * aspect) < 648 {
++                minH += 2
++            }
++            // Ensure the largest step's @2x backing max axis is >= 3840 (within
++            // descriptor capacity) so macOS presents the scaled thumbnail UI.
++            let targetLogicalMaxAxis = min(1920, maxLogical)
++            let minMaxHForAxis = aspect >= 1.0
++                ? evenCeil(Double(targetLogicalMaxAxis) / aspect)
++                : targetLogicalMaxAxis
++            maxH = max(even(Double(panelHigh)), minMaxHForAxis)
++            while max(even(Double(maxH) * aspect), maxH) < targetLogicalMaxAxis && maxH + 2 <= maxHAllowed {
++                maxH += 2
++            }
++        }
++
++        maxH = min(maxH, maxHAllowed)
++        minH = min(minH, maxH)
++
++        var pairs: [(Int, Int)] = []
++        for i in 0...4 {
++            let rawH = Double(minH) + Double(maxH - minH) * Double(i) / 4.0
++            let h = min(even(rawH), maxHAllowed)
++            let w = min(even(Double(h) * aspect), maxLogical)
++            guard w * clampedScale <= maxPixelsPerAxis, h * clampedScale <= maxPixelsPerAxis else { continue }
++            pairs.append((w, h))
++        }
++
++        // For smaller panels whose 1:1 logical size falls between the 648pt
++        // floor and the >=3840-backing ceiling (e.g. 1600x900, 1366x768), snap
++        // the closest non-ceiling step to the panel's exact 1:1 mode.
++        if !isHighRes, pairs.count == 5,
++           nativeW >= 648, nativeH >= 648,
++           nativeW * clampedScale <= maxPixelsPerAxis, nativeH * clampedScale <= maxPixelsPerAxis,
++           !pairs.contains(where: { $0.0 == nativeW && $0.1 == nativeH }) {
++            let candidates = (0..<(pairs.count - 1)).filter { idx in
++                let prevOK = idx == 0 || (pairs[idx - 1].0 < nativeW && pairs[idx - 1].1 < nativeH)
++                let nextOK = nativeW < pairs[idx + 1].0 && nativeH < pairs[idx + 1].1
++                return prevOK && nextOK
++            }
++            if let best = candidates.min(by: { abs(pairs[$0].1 - nativeH) < abs(pairs[$1].1 - nativeH) }) {
++                pairs[best] = (nativeW, nativeH)
++            }
++        }
++
 +        var seen = Set<String>()
 +        var list: [CGVirtualDisplayMode] = []
-+        for d in divisors {
-+            let w = max(2, Int((Double(nativeW) / d).rounded()) & ~1)
-+            let h = max(2, Int((Double(nativeH) / d).rounded()) & ~1)
-+            guard w * scale <= maxPixelsPerAxis, h * scale <= maxPixelsPerAxis else { continue }
++        for (w, h) in pairs {
 +            let key = "\(w)x\(h)"
 +            if seen.insert(key).inserted {
 +                list.append(CGVirtualDisplayMode(width: UInt(w), height: UInt(h), refreshRate: 60))
 +            }
 +        }
 +        if list.isEmpty {
-+            list.append(CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60))
++            list.append(CGVirtualDisplayMode(width: UInt(nativeW), height: UInt(nativeH), refreshRate: 60))
 +        }
 +        return list
 +    }
++
++    static func scaledModes(pointsWide: Int, pointsHigh: Int, scale: Int, maxPixelsPerAxis: Int) -> [CGVirtualDisplayMode] {
++        scaledModes(panelWide: pointsWide * scale, panelHigh: pointsHigh * scale, scale: scale, maxPixelsPerAxis: maxPixelsPerAxis)
++    }
++
++    static func syntheticMillimeters(for modes: [CGVirtualDisplayMode]) -> CGSize {
++        guard !modes.isEmpty else { return CGSize(width: 300, height: 190) }
++        let mid = modes[modes.count / 2]
++        let midW = max(2, Int(mid.width))
++        let midH = max(2, Int(mid.height))
++        let aspect = Double(midW) / Double(midH)
++        let mmH = max(50.0, (Double(midH) * 25.4 / 110.0).rounded())
++        let mmW = max(50.0, (mmH * aspect).rounded())
++        return CGSize(width: mmW, height: mmH)
++    }
++
      init?(name: String, pointsWide: Int, pointsHigh: Int, scale: Int = 2,
            descriptorMaxPixelsPerAxis: Int, sizeInMillimeters: CGSize,
            serialNum: UInt32 = 0x0001, productID: UInt32 = 0x4F53,
-@@ -86,30 +106,11 @@
++          modes: [CGVirtualDisplayMode]? = nil,
+           restoreOrigin: CGPoint? = nil,
+           onOriginChange: ((CGPoint, CGSize) -> Void)? = nil) {
+         self.pointsWide = pointsWide
+@@ -86,30 +195,11 @@
              return nil
          }
          Log.info("virtual display created: id=\(display.displayID) \(pointsWide)x\(pointsHigh)pt @\(self.scale)x")
@@ -56,25 +148,33 @@
 -                try? await Task.sleep(for: .milliseconds(settled ? 2000 : 200))
 -            }
 +        ensureNotMirrored()
-+        let fullModes = Self.scaledModes(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: self.scale, maxPixelsPerAxis: maxPixelsPerAxis)
-+        if fullModes.count > 1 {
++        let fullModes = modes ?? Self.scaledModes(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: self.scale, maxPixelsPerAxis: maxPixelsPerAxis)
++        if fullModes.count > 1 || (fullModes.count == 1 && (Int(fullModes[0].width) != pointsWide || Int(fullModes[0].height) != pointsHigh)) {
 +            settings.modes = fullModes
 +            _ = display.apply(settings)
          }
      }
-
-@@ -135,9 +136,7 @@
-
+ 
+@@ -125,6 +215,7 @@
+     @MainActor
+     @discardableResult
+     func resize(pointsWide: Int, pointsHigh: Int, scale: Int? = nil,
++                modes: [CGVirtualDisplayMode]? = nil,
+                 movingTo origin: CGPoint?,
+                 stillCurrent: @MainActor () -> Bool = { true }) async -> Bool {
+         let scale = scale.map { $0 < 2 ? 1 : 2 } ?? self.scale
+@@ -135,9 +226,7 @@
+ 
          let newSettings = CGVirtualDisplaySettings()
          newSettings.hiDPI = scale == 2 ? 1 : 0
 -        newSettings.modes = [
 -            CGVirtualDisplayMode(width: UInt(pointsWide), height: UInt(pointsHigh), refreshRate: 60)
 -        ]
-+        newSettings.modes = Self.scaledModes(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale, maxPixelsPerAxis: maxPixelsPerAxis)
++        newSettings.modes = modes ?? Self.scaledModes(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale, maxPixelsPerAxis: maxPixelsPerAxis)
          // The enforcement tick must not run between the new mode and its
          // placement: it would re-apply the old origin target, or report
          // WindowServer's own placement as a user drag. A count, so a resize
-@@ -183,7 +182,7 @@
+@@ -183,7 +272,7 @@
              var config: CGDisplayConfigRef?
              guard CGBeginDisplayConfiguration(&config) == .success else { return true }
              CGConfigureDisplayOrigin(config, display.displayID, Int32(origin.x), Int32(origin.y))
@@ -83,7 +183,7 @@
              outcome = "moved from (\(Int(settled.x)),\(Int(settled.y))) (result \(err.rawValue))"
              settled = CGDisplayBounds(display.displayID).origin
          }
-@@ -256,7 +256,7 @@
+@@ -256,7 +345,7 @@
          var config: CGDisplayConfigRef?
          CGBeginDisplayConfiguration(&config)
          CGConfigureDisplayWithDisplayMode(config, display.displayID, hidpi, nil)
@@ -92,7 +192,7 @@
          if err == .success {
              hidpiRefusals = 0
              Log.info("display mode (re)selected: \(hidpi.width)x\(hidpi.height)@\(scale)x (result 0)")
-@@ -302,7 +302,7 @@
+@@ -302,7 +391,7 @@
              var config: CGDisplayConfigRef?
              guard CGBeginDisplayConfiguration(&config) == .success else { return }
              CGConfigureDisplayOrigin(config, id, Int32(target.x), Int32(target.y))
@@ -101,7 +201,7 @@
              let settled = CGDisplayBounds(id).origin
              originRestore.settled(at: settled)
              Log.info("display \(id) origin (\(Int(origin.x)),\(Int(origin.y))) → restored "
-@@ -334,15 +334,8 @@
+@@ -334,15 +423,8 @@
          // Detach the virtual display itself (covers "macOS mirrors the VD onto
          // the main display")...
          CGConfigureDisplayMirrorOfDisplay(config, id, kCGNullDirectDisplay)

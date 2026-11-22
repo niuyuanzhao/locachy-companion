@@ -49,6 +49,7 @@ enum ProtocolTests {
         pairingTests()
         scrollSemanticTests()
         modifierTransitionTests()
+        tabletAndTouchTests()
         if failures == 0 {
             print("PASS: all protocol tests")
             exit(0)
@@ -83,14 +84,40 @@ enum ProtocolTests {
             check(native.width == 2160 && native.height == 1440 && native.scale == 2,
                   "computes exact 1:1 HiDPI geometry from a 2160x1440 handshake")
             let odd = try hello(receiverHello
-                .replacingOccurrences(of: "\"width\":1920,\"height\":1200,\"scale\":2.000", with: "\"width\":2562,\"height\":1442,\"scale\":2.000")
-                .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":2562,\"pixelsHigh\":1442"))
-            check(odd.scale == 1, "falls back to 1x when 2x points would round physical dimensions")
+                .replacingOccurrences(of: "\"width\":1920,\"height\":1200,\"scale\":2.000", with: "\"width\":1366,\"height\":768,\"scale\":1.000")
+                .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":1366,\"pixelsHigh\":768"))
+            check(odd.scale == 2, "enables HiDPI scaling for mainstream non-div4 panels (1366x768)")
+            let tiny = try hello(receiverHello
+                .replacingOccurrences(of: "\"width\":1920,\"height\":1200,\"scale\":2.000", with: "\"width\":320,\"height\":240,\"scale\":1.000")
+                .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":320,\"pixelsHigh\":240"))
+            check(tiny.scale == 1, "falls back to 1x for tiny sub-VGA panels")
         } catch {
             check(false, "computes exact geometry from handshake: \(error)")
         }
-        expectThrow("rejects HEVC-only receivers") {
-            _ = try hello(receiverHello.replacingOccurrences(of: "\"codec\":\"h264\"", with: "\"codec\":\"hevc\""))
+        do {
+            // Comet Lake (Gen9.5): offers h264 + hevc420 (no 4:4:4) -> picks hevc420 at 60 fps.
+            let cml = try hello(receiverHello
+                .replacingOccurrences(of: "\"width\":1920,\"height\":1200", with: "\"width\":3840,\"height\":2160")
+                .replacingOccurrences(of: "\"pixelsWide\":1920,\"pixelsHigh\":1200", with: "\"pixelsWide\":3840,\"pixelsHigh\":2160")
+                .replacingOccurrences(of: "[{\"codec\":\"h264\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60}]",
+                                      with: "[{\"codec\":\"h264\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60},{\"codec\":\"hevc420\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60}]"))
+            check(cml.codec == "hevc420" && cml.streamCodec == "hevc" && cml.fps == 60,
+                  "negotiates hevc420 at 4K60 when receiver offers h264+hevc420")
+            // Ice Lake (Gen11+): offers h264 + hevc420 + hevc444 + hevc -> picks hevc444.
+            let icl = try hello(receiverHello
+                .replacingOccurrences(of: "[{\"codec\":\"h264\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60}]",
+                                      with: "[{\"codec\":\"h264\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60},{\"codec\":\"hevc420\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60},{\"codec\":\"hevc444\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60},{\"codec\":\"hevc\",\"maxWidth\":4096,\"maxHeight\":4096,\"maxFramesPerSecond\":60}]"))
+            check(icl.codec == "hevc444" && icl.streamCodec == "hevc",
+                  "prefers hevc444 when hardware supports HEVC 4:4:4")
+            // Optional input capabilities ("touch", "tablet") are recorded without breaking older hellos.
+            let withDirect = try hello(receiverHello.replacingOccurrences(of: "\"scroll\"]", with: "\"scroll\",\"touch\",\"tablet\"]"))
+            check(withDirect.supportedInput.contains("touch") && withDirect.supportedInput.contains("tablet"),
+                  "records optional touch and tablet input capabilities from hello")
+        } catch {
+            check(false, "codec and input capability negotiation: \(error)")
+        }
+        expectThrow("rejects receivers with only unsupported codecs") {
+            _ = try hello(receiverHello.replacingOccurrences(of: "\"codec\":\"h264\"", with: "\"codec\":\"vp9\""))
         }
         expectThrow("rejects a missing scroll capability") {
             _ = try hello(receiverHello.replacingOccurrences(of: ",\"scroll\"", with: ""))
@@ -195,6 +222,139 @@ enum ProtocolTests {
                   "a Shift press shows Shift and its release clears it (state after the event)")
         } catch {
             check(false, "Shift transitions, state after: \(error)")
+        }
+    }
+
+    static func tabletAndTouchTests() {
+        let negRect = CGRect(x: -1920, y: 120, width: 1920, height: 1080)
+        var clock: TimeInterval = 100.0
+        let recorder = Recorder()
+        let input = RemoteInput(bounds: { negRect }, now: { clock }, sink: { recorder.posted.append($0) })
+        do {
+            // Active stylus proximity (pen) -> tip down -> axis (pressure + tilt) -> tip up -> eraser switch -> barrel -> cancel
+            try input.handle(["type": "tablet", "event": "proximity", "in": true, "tool": "pen",
+                              "id": 12345, "caps": 7, "x": 0.5, "y": 0.25])
+            check(recorder.posted.count == 2 && recorder.posted[0].type == .tabletProximity
+                  && recorder.posted[0].getIntegerValueField(.tabletProximityEventPointerType) == 1
+                  && recorder.posted[0].getIntegerValueField(.tabletProximityEventEnterProximity) == 1
+                  && (recorder.posted[0].getIntegerValueField(.tabletProximityEventCapabilityMask) & 0x0580) == 0x0580
+                  && abs(recorder.posted[1].location.x - (-960.0)) < 0.01
+                  && abs(recorder.posted[1].location.y - 390.0) < 0.01,
+                  "tablet proximity maps strictly into negative-origin virtual display with Quartz capability mask")
+
+            recorder.posted.removeAll()
+            try input.handle(["type": "tablet", "event": "tip", "down": true, "x": 0.5, "y": 0.25, "pressure": 0.25, "buttons": 1])
+            try input.handle(["type": "tablet", "event": "axis", "x": 0.501, "y": 0.252, "pressure": 0.65,
+                              "tiltX": 30.0, "tiltY": -15.0, "distance": 0.0, "rotation": 0.0, "buttons": 1])
+            try input.handle(["type": "tablet", "event": "tip", "down": false, "x": 0.501, "y": 0.252, "pressure": 0.0, "buttons": 0])
+            check(recorder.posted.count == 3
+                  && recorder.posted[0].type == .leftMouseDown
+                  && recorder.posted[1].type == .leftMouseDragged
+                  && recorder.posted[2].type == .leftMouseUp
+                  && abs(recorder.posted[1].getDoubleValueField(.mouseEventPressure) - 0.65) < 0.02
+                  && abs(recorder.posted[1].getDoubleValueField(.tabletEventPointPressure) - 0.65) < 0.02
+                  && abs(recorder.posted[1].getDoubleValueField(.tabletEventTiltX) - 0.5) < 0.02
+                  && abs(recorder.posted[1].getDoubleValueField(.tabletEventTiltY) - (-0.25)) < 0.02
+                  && recorder.posted[1].getIntegerValueField(.mouseEventSubtype) == Int64(CGEventMouseSubtype.tabletPoint.rawValue),
+                  "tablet stroke sets BOTH mouseEventPressure and tabletEventPointPressure plus tilt and tabletPoint subtype")
+
+            recorder.posted.removeAll()
+            try input.handle(["type": "tablet", "event": "proximity", "in": true, "tool": "eraser",
+                              "id": 999, "caps": 1, "x": 0.25, "y": 0.5])
+            check(recorder.posted.count == 3
+                  && recorder.posted[0].type == .tabletProximity
+                  && recorder.posted[0].getIntegerValueField(.tabletProximityEventEnterProximity) == 0
+                  && recorder.posted[1].type == .tabletProximity
+                  && recorder.posted[1].getIntegerValueField(.tabletProximityEventPointerType) == 3
+                  && recorder.posted[1].getIntegerValueField(.tabletProximityEventEnterProximity) == 1,
+                  "switching pen to eraser emits proximity-out then eraser proximity-in")
+
+            recorder.posted.removeAll()
+            try input.handle(["type": "tablet", "event": "button", "button": 331, "state": 1, "x": 0.25, "y": 0.5, "buttons": 2])
+            try input.handle(["type": "tablet", "event": "button", "button": 331, "state": 0, "x": 0.25, "y": 0.5, "buttons": 0])
+            try input.handle(["type": "cancel", "scope": "all"])
+            check(recorder.posted.count == 3
+                  && recorder.posted[0].type == .rightMouseDown
+                  && recorder.posted[1].type == .rightMouseUp
+                  && recorder.posted[2].type == .tabletProximity
+                  && recorder.posted[2].getIntegerValueField(.tabletProximityEventEnterProximity) == 0,
+                  "stylus lower barrel maps to right-click and cancel emits proximity-out")
+
+            // Multi-touch: 1-finger tap at exact display coordinates
+            recorder.posted.removeAll()
+            clock = 200.0
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "down", "x": 0.5, "y": 0.5, "xmm": 150.0, "ymm": 90.0]]])
+            clock = 200.08
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "up", "x": 0.5, "y": 0.5, "xmm": 150.5, "ymm": 90.2]]])
+            check(recorder.posted.count == 2 && recorder.posted[0].type == .leftMouseDown && recorder.posted[1].type == .leftMouseUp
+                  && abs(recorder.posted[0].location.x - (-960.0)) < 0.01 && abs(recorder.posted[0].location.y - 660.0) < 0.01,
+                  "1-finger tap clicks at exact virtual display coordinates")
+
+            // Multi-touch: 1-finger long-press -> right click, lift does nothing
+            recorder.posted.removeAll()
+            clock = 210.0
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "down", "x": 0.25, "y": 0.25, "xmm": 75.0, "ymm": 45.0]]])
+            clock = 210.6
+            input.tickLongPress()
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "up", "x": 0.25, "y": 0.25, "xmm": 75.0, "ymm": 45.0]]])
+            check(recorder.posted.count == 2 && recorder.posted[0].type == .rightMouseDown && recorder.posted[1].type == .rightMouseUp,
+                  "1-finger long-press emits right-click and ignores lift")
+
+            // Multi-touch: 1-finger drag -> leftMouseDown, leftMouseDragged, leftMouseUp
+            recorder.posted.removeAll()
+            clock = 220.0
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "down", "x": 0.2, "y": 0.2, "xmm": 60.0, "ymm": 40.0]]])
+            clock = 220.05
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "move", "x": 0.3, "y": 0.2, "xmm": 90.0, "ymm": 40.0]]])
+            clock = 220.1
+            try input.handle(["type": "touch", "phase": "frame", "points": [["id": 0, "state": "up", "x": 0.3, "y": 0.2, "xmm": 90.0, "ymm": 40.0]]])
+            check(recorder.posted.map { $0.type } == [.leftMouseDown, .leftMouseDragged, .leftMouseUp],
+                  "1-finger drag emits left mouse down, dragged, and up")
+
+            // Multi-touch: 2-finger smooth scroll sets event.location inside virtual display
+            recorder.posted.removeAll()
+            clock = 230.0
+            try input.handle(["type": "touch", "phase": "frame", "points": [
+                ["id": 0, "state": "down", "x": 0.4, "y": 0.5, "xmm": 120.0, "ymm": 90.0],
+                ["id": 1, "state": "down", "x": 0.6, "y": 0.5, "xmm": 180.0, "ymm": 90.0]
+            ]])
+            clock = 230.05
+            try input.handle(["type": "touch", "phase": "frame", "points": [
+                ["id": 0, "state": "move", "x": 0.4, "y": 0.4, "xmm": 120.0, "ymm": 72.0],
+                ["id": 1, "state": "move", "x": 0.6, "y": 0.4, "xmm": 180.0, "ymm": 72.0]
+            ]])
+            clock = 230.1
+            try input.handle(["type": "touch", "phase": "frame", "points": [
+                ["id": 0, "state": "up", "x": 0.4, "y": 0.4, "xmm": 120.0, "ymm": 72.0],
+                ["id": 1, "state": "up", "x": 0.6, "y": 0.4, "xmm": 180.0, "ymm": 72.0]
+            ]])
+            let scrolls = recorder.posted.filter { $0.type == .scrollWheel }
+            check(scrolls.count == 3
+                  && scrolls.map { $0.getIntegerValueField(.scrollWheelEventScrollPhase) } == [1, 2, 4]
+                  && scrolls.allSatisfy { negRect.contains($0.location) },
+                  "2-finger scroll emits began/changed/ended anchored inside virtual display bounds")
+
+            // Multi-touch: 2-finger pinch emits Command+ zoom step
+            recorder.posted.removeAll()
+            clock = 240.0
+            try input.handle(["type": "touch", "phase": "frame", "points": [
+                ["id": 0, "state": "down", "x": 0.45, "y": 0.5, "xmm": 135.0, "ymm": 90.0],
+                ["id": 1, "state": "down", "x": 0.55, "y": 0.5, "xmm": 165.0, "ymm": 90.0]
+            ]])
+            clock = 240.05
+            try input.handle(["type": "touch", "phase": "frame", "points": [
+                ["id": 0, "state": "move", "x": 0.40, "y": 0.5, "xmm": 120.0, "ymm": 90.0],
+                ["id": 1, "state": "move", "x": 0.60, "y": 0.5, "xmm": 180.0, "ymm": 90.0]
+            ]])
+            try input.handle(["type": "touch", "phase": "frame", "points": [
+                ["id": 0, "state": "up", "x": 0.40, "y": 0.5, "xmm": 120.0, "ymm": 90.0],
+                ["id": 1, "state": "up", "x": 0.60, "y": 0.5, "xmm": 180.0, "ymm": 90.0]
+            ]])
+            let zooms = recorder.posted.filter { $0.type == .keyDown && $0.flags.contains(.maskCommand) }
+            check(!zooms.isEmpty && zooms.allSatisfy { $0.getIntegerValueField(.keyboardEventKeycode) == 24 },
+                  "2-finger pinch outward emits Command+ zoom steps")
+        } catch {
+            check(false, "tablet and multi-touch tests: \(error)")
         }
     }
 

@@ -18,6 +18,6 @@ brew services start locachy-macos-sender
 
 ## 显示几何与输入转发
 
-接收端在已认证握手里上报面板物理像素尺寸（`pixelsWide × pixelsHigh`）及脱敏后的 `host`／`model` 机器标识。发送端按物理尺寸计算 `1:1` 基础几何（高密度且可整除为偶数逻辑点时采用 `@2x` HiDPI，否则 `@1x`），在 **系统设置 → 显示器** 中提供五档比例缩放模式（`2.0×`、`1.75×`、`1.5×`、`1.25×`、`1.0×`，对应“更大文字 ↔ 更多空间”），并按 `(host, model, pixelsWide × pixelsHigh)` 查询本机模式表（`~/Library/Application Support/LOCachy/display-modes.json`）：首次连接默认使用 `1:1`，之后会记住每台机器选定的缩放档位并在重连／重插时直接恢复。处于 1:1 模式时零缩放直出；切到中间分数 HiDPI 档位时按原生 HiDPI 分辨率采样并经 Metal Mitchell 双三次（`B=1/3, C=1/3`）无黑边下采样至面板物理像素，再由硬件 HEVC 4:4:4（或回退 H.264）编码输出。
+接收端在已认证握手里上报面板物理像素尺寸（`pixelsWide × pixelsHigh`）、脱敏后的 `host`／`model` 机器标识、精确硬件视频解码能力（`hevc444`、`hevc420`、`h264` 或旧版 `hevc`）及输入能力（`touch`、`tablet`）。发送端据此为任意主流分辨率与纵横比自动推导 5 档 HiDPI 比例缩放及物理尺寸提示，在 **系统设置 → 显示器** 中提供“更大文字 ↔ 更多空间”缩略档位（高密度屏默认 `1:1` HiDPI，标准密度默认 `1:1` 原生），并按 `(host, model, pixelsWide × pixelsHigh)` 记入 `~/Library/Application Support/LOCachy/display-modes.json` 供重连自动恢复。处于 `1:1` 档位时零缩放直出；其余档位经 Metal Mitchell 双三次（`B=1/3, C=1/3`）无黑边采样至面板物理像素，并自动按双方硬件能力优先级（`hevc444 → hevc → hevc420 → h264`）以 VideoToolbox 硬件编码输出。
 
-LOCachy 的键盘、触摸板与鼠标输入可跨 Mac 的所有活动显示器使用。拔出线缆后，虚拟显示器自动移除，服务继续在后台等待下一次连接。
+LOCachy 的鼠标与触摸板可跨 Mac 的所有活动显示器自由移动；当接收端启用 `"touch"` 与 `"tablet"` 时，触摸屏多点手势（点按／拖拽／长按右键／双指滚动／捏合缩放）和主动手写笔数位屏事件（接近离开、笔／橡皮擦自动切换、压感、X/Y 倾斜角、悬停、笔身按键）均直接映射到扩展屏区域。拔出线缆后，虚拟显示器自动移除，服务继续等待下一次连接。

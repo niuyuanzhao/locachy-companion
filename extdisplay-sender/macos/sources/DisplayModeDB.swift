@@ -49,8 +49,7 @@ final class DisplayModeDB {
         if mode.pixelsWide == mode.pointsWide * panel.scale && mode.pixelsHigh == mode.pointsHigh * panel.scale {
             return true
         }
-        return mode.pointsWide == panel.width && mode.pointsHigh == panel.height
-            && mode.pixelsWide == panel.width && mode.pixelsHigh == panel.height
+        return mode.pixelsWide == mode.pointsWide && mode.pixelsHigh == mode.pointsHigh
     }
 
     func lookup(for panel: Panel, allowedPointSizes: [(Int, Int)]) -> SavedDisplayMode? {

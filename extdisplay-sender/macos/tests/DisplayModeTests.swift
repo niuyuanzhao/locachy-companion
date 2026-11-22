@@ -21,23 +21,40 @@ enum DisplayModeTests {
     }
 
     static func testScaledModes() {
-        let m2x = VirtualDisplay.scaledModes(pointsWide: 1080, pointsHigh: 720, scale: 2, maxPixelsPerAxis: 8192)
+        let m4k = VirtualDisplay.scaledModes(panelWide: 3840, panelHigh: 2160, scale: 2, maxPixelsPerAxis: 8192)
+        let dims4k = m4k.map { "\($0.width)x\($0.height)" }
+        check(dims4k == ["1920x1080", "2400x1350", "2880x1620", "3360x1890", "3840x2160"],
+              "publishes 5 proportional HiDPI steps from 1920x1080@2x to 3840x2160 for a 4K panel")
+        let mm4k = VirtualDisplay.syntheticMillimeters(for: m4k)
+        check(mm4k.width > 550 && mm4k.width < 800 && mm4k.height > 300 && mm4k.height < 450,
+              "derives synthetic physical size for 4K around 110 pt-DPI (\(Int(mm4k.width))x\(Int(mm4k.height))mm)")
+
+        let m2x = VirtualDisplay.scaledModes(panelWide: 2160, panelHigh: 1440, scale: 2, maxPixelsPerAxis: 8192)
         let dims2x = m2x.map { "\($0.width)x\($0.height)" }
-        check(dims2x == ["1080x720", "1234x822", "1440x960", "1728x1152", "2160x1440"],
+        check(dims2x == ["1080x720", "1350x900", "1620x1080", "1890x1260", "2160x1440"],
               "publishes 5 proportional HiDPI steps for a 2160x1440 panel")
 
-        let m1080 = VirtualDisplay.scaledModes(pointsWide: 960, pointsHigh: 540, scale: 2, maxPixelsPerAxis: 8192)
-        let dims1080 = m1080.map { "\($0.width)x\($0.height)" }
-        check(dims1080 == ["960x540", "1096x616", "1280x720", "1536x864", "1920x1080"],
-              "publishes 5 proportional HiDPI steps for a 1920x1080 panel")
+        let m1080 = VirtualDisplay.scaledModes(panelWide: 1920, panelHigh: 1080, scale: 2, maxPixelsPerAxis: 8192)
+        check(m1080.count == 5 && m1080.allSatisfy { $0.width >= 648 && $0.height >= 648 }
+              && m1080.last!.width * 2 >= 3840 && m1080.contains(where: { $0.width == 1920 && $0.height == 1080 }),
+              "publishes 5 valid >=648pt HiDPI steps with >=3840 backing for 1920x1080")
 
-        let m1x = VirtualDisplay.scaledModes(pointsWide: 1366, pointsHigh: 768, scale: 1, maxPixelsPerAxis: 8192)
-        check(m1x.count == 1 && m1x[0].width == 1366 && m1x[0].height == 768,
+        let m1366 = VirtualDisplay.scaledModes(panelWide: 1366, panelHigh: 768, scale: 2, maxPixelsPerAxis: 8192)
+        check(m1366.count == 5 && m1366.allSatisfy { $0.width >= 648 && $0.height >= 648 }
+              && m1366.last!.width * 2 >= 3840 && m1366.contains(where: { $0.width == 1366 && $0.height == 768 }),
+              "publishes 5 valid HiDPI steps including 1:1 1366x768 for non-div4 panels")
+
+        let mPortrait = VirtualDisplay.scaledModes(panelWide: 1080, panelHigh: 1920, scale: 2, maxPixelsPerAxis: 8192)
+        check(mPortrait.count == 5 && mPortrait.allSatisfy { $0.width >= 648 && $0.height >= 648 }
+              && mPortrait.last!.height * 2 >= 3840,
+              "publishes 5 valid HiDPI steps for portrait 1080x1920 panels")
+
+        let m1x = VirtualDisplay.scaledModes(panelWide: 512, panelHigh: 384, scale: 1, maxPixelsPerAxis: 8192)
+        check(m1x.count == 1 && m1x[0].width == 512 && m1x[0].height == 384,
               "keeps a single 1:1 mode on 1x panels")
 
-        let capped = VirtualDisplay.scaledModes(pointsWide: 1920, pointsHigh: 1080, scale: 2, maxPixelsPerAxis: 5120)
-        let dimsCapped = capped.map { "\($0.width)x\($0.height)" }
-        check(dimsCapped == ["1920x1080", "2194x1234", "2560x1440"],
+        let capped = VirtualDisplay.scaledModes(panelWide: 3840, panelHigh: 2160, scale: 2, maxPixelsPerAxis: 5120)
+        check(capped.allSatisfy { $0.width * 2 <= 5120 && $0.height * 2 <= 5120 } && !capped.isEmpty,
               "omits scaled modes exceeding descriptor pixel capacity")
     }
 
@@ -120,11 +137,11 @@ enum DisplayModeTests {
             check(false, "parses named receiver hellos for DisplayModeDB tests")
             return
         }
-        let allowed = VirtualDisplay.scaledModes(pointsWide: 1080, pointsHigh: 720, scale: 2, maxPixelsPerAxis: 8192)
+        let allowed = VirtualDisplay.scaledModes(panelWide: 2160, panelHigh: 1440, scale: 2, maxPixelsPerAxis: 8192)
             .map { (Int($0.width), Int($0.height)) }
         check(db.lookup(for: fv1, allowedPointSizes: allowed) == nil,
               "returns nil for an unseen receiver (defaults to 1:1)")
-        let chosen = SavedDisplayMode(pointsWide: 1440, pointsHigh: 960, pixelsWide: 2880, pixelsHigh: 1920)
+        let chosen = SavedDisplayMode(pointsWide: 1620, pointsHigh: 1080, pixelsWide: 3240, pixelsHigh: 2160)
         db.save(for: fv1, mode: chosen, allowedPointSizes: allowed)
         let dbReloaded = DisplayModeDB(fileURL: tmp)
         check(dbReloaded.lookup(for: fv1, allowedPointSizes: allowed) == chosen,

@@ -37,6 +37,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     private var captureHeight = 0
     private var sleepAssertion: IOPMAssertionID = 0
     private var wakeAssertion: IOPMAssertionID = 0
+    private var reconfigRegistered = false
+    private var reconfigContext: UnsafeMutableRawPointer?
     private lazy var ciContext: CIContext? = {
         guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         return CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
@@ -47,6 +49,14 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
     init(transport: SecureTransport, panel: Panel) {
         self.transport = transport
         self.panel = panel
+    }
+
+    private static let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+        guard let userInfo, !flags.contains(.beginConfigurationFlag) else { return }
+        let session = Unmanaged<CaptureSession>.fromOpaque(userInfo).takeUnretainedValue()
+        DispatchQueue.main.async { [weak session] in
+            session?.input?.invalidateDisplayCache()
+        }
     }
 
     // Main actor: CGVirtualDisplay installs its WindowServer callbacks on main.
@@ -65,13 +75,19 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let plan = VirtualCanvasSizing.plan(pixelsWide: panel.width, pixelsHigh: panel.height, scale: panel.scale)
         else { throw SenderError("Receiver panel dimensions are unsupported") }
         let first = plan.bootstrap
-        let millimeters = first.pointsWide >= first.pointsHigh ? CGSize(width: 300, height: 190) : CGSize(width: 190, height: 300)
+        let allowedModes = VirtualDisplay.scaledModes(
+            panelWide: panel.width, panelHigh: panel.height,
+            scale: plan.requested.scale, maxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis)
+        let allowedPointSizes = allowedModes.map { (Int($0.width), Int($0.height)) }
+        let millimeters = VirtualDisplay.syntheticMillimeters(for: allowedModes)
+        let initialModes: [CGVirtualDisplayMode]? = (plan.requested == first) ? allowedModes : nil
         var createdDisplay: VirtualDisplay?
         for probe: UInt32 in 0..<8 {
             if let candidate = VirtualDisplay(
                 name: "LOCachy", pointsWide: first.pointsWide, pointsHigh: first.pointsHigh,
                 scale: first.scale, descriptorMaxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis,
-                sizeInMillimeters: millimeters, serialNum: 0x4C4F4301 + probe, productID: 0x4C4F + probe
+                sizeInMillimeters: millimeters, serialNum: 0x4C4F4301 + probe, productID: 0x4C4F + probe,
+                modes: initialModes
             ) {
                 createdDisplay = candidate
                 break
@@ -84,17 +100,33 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             let id = created.displayID
             if plan.requested != first {
                 guard await created.resize(pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
-                                           scale: plan.requested.scale, movingTo: nil) else {
+                                           scale: plan.requested.scale, modes: allowedModes, movingTo: nil) else {
                     throw SenderError("macOS rejected the receiver resolution")
                 }
             }
-            let allowedModes = VirtualDisplay.scaledModes(
-                pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
-                scale: plan.requested.scale, maxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis)
-            let allowedPointSizes = allowedModes.map { (Int($0.width), Int($0.height)) }
-            let defaultTarget = SavedDisplayMode(
-                pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
-                pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
+            let defaultTarget: SavedDisplayMode
+            let exactHiDPI = (panel.width / 2, panel.height / 2)
+            let native1x = (panel.width & ~1, panel.height & ~1)
+            if panel.scale == 2, min(panel.width, panel.height) >= 1296,
+               allowedPointSizes.contains(where: { $0.0 == exactHiDPI.0 && $0.1 == exactHiDPI.1 }) {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: exactHiDPI.0, pointsHigh: exactHiDPI.1,
+                    pixelsWide: exactHiDPI.0 * 2, pixelsHigh: exactHiDPI.1 * 2)
+            } else if allowedPointSizes.contains(where: { $0.0 == native1x.0 && $0.1 == native1x.1 }) {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: native1x.0, pointsHigh: native1x.1,
+                    pixelsWide: native1x.0, pixelsHigh: native1x.1)
+            } else if let closest = allowedPointSizes.min(by: {
+                abs($0.1 - panel.height) + abs($0.0 - panel.width) < abs($1.1 - panel.height) + abs($1.0 - panel.width)
+            }) {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: closest.0, pointsHigh: closest.1,
+                    pixelsWide: closest.0 * panel.scale, pixelsHigh: closest.1 * panel.scale)
+            } else {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
+                    pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
+            }
             var targetMode = DisplayModeDB.shared.lookup(for: panel, allowedPointSizes: allowedPointSizes) ?? defaultTarget
             for _ in 0..<20 {
                 selectNativeMode(id: id, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
@@ -137,6 +169,11 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             try Task.checkCancellation()
             try configureEncoder(width: width, height: height)
             input = RemoteInput(displayID: id)
+            let ctx = Unmanaged.passUnretained(self).toOpaque()
+            if CGDisplayRegisterReconfigurationCallback(Self.displayReconfigurationCallback, ctx) == .success {
+                reconfigContext = ctx
+                reconfigRegistered = true
+            }
             let filter = SCContentFilter(display: target, excludingWindows: [])
             let configuration = makeStreamConfiguration(width: capW, height: capH)
             let capture = SCStream(filter: filter, configuration: configuration, delegate: self)
@@ -303,8 +340,26 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         throw SenderError("The virtual display did not appear in ScreenCaptureKit")
     }
 
+    private func isUsingHardwareEncoder(_ session: VTCompressionSession) -> Bool {
+        var dict: CFDictionary?
+        guard VTSessionCopySupportedPropertyDictionary(session, supportedPropertyDictionaryOut: &dict) == noErr else { return false }
+        let out = UnsafeMutablePointer<CFTypeRef?>.allocate(capacity: 1)
+        out.initialize(to: nil)
+        defer { out.deinitialize(count: 1); out.deallocate() }
+        let status = VTSessionCopyProperty(
+            session,
+            key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+            allocator: nil,
+            valueOut: out)
+        guard status == noErr, let boolVal = out.pointee as? Bool else { return false }
+        return boolVal
+    }
+
     private func configureEncoder(width: Int, height: Int) throws {
         var created: VTCompressionSession?
+        // Omit EnableLowLatencyRateControl: on Apple Silicon it causes
+        // VideoToolbox to fall back to software encoding (~22 ms/frame) for H.264
+        // and silently downgrades HEVC 4:4:4 to 4:2:0.
         let hwSpec: CFDictionary = [
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: kCFBooleanTrue
         ] as CFDictionary
@@ -314,9 +369,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!
         ] as CFDictionary
-        if panel.codec == "hevc" {
-            // EnableLowLatencyRateControl silently downgrades HEVC_Main444_AutoLevel to 4:2:0 on Apple Silicon.
-            // RequireHardwareAcceleratedVideoEncoder + RealTime + MaxFrameDelayCount=0 keeps true 4:4:4 at ~8.8ms/frame.
+        if panel.codec == "hevc444" || panel.codec == "hevc" || panel.codec == "hevc420" {
+            let want444 = panel.codec == "hevc444" || panel.codec == "hevc"
             var status = VTCompressionSessionCreate(
                 allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_HEVC,
                 encoderSpecification: hwSpec, imageBufferAttributes: bgraAttrs, compressedDataAllocator: nil,
@@ -328,8 +382,13 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                     outputCallback: nil, refcon: nil, compressionSessionOut: &created)
             }
             if status == noErr, let session = created {
-                if VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
-                                        value: "HEVC_Main444_AutoLevel" as CFString) != noErr {
+                if want444 {
+                    if VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
+                                            value: "HEVC_Main444_AutoLevel" as CFString) != noErr {
+                        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
+                                             value: kVTProfileLevel_HEVC_Main_AutoLevel)
+                    }
+                } else {
                     VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
                                          value: kVTProfileLevel_HEVC_Main_AutoLevel)
                 }
@@ -339,28 +398,31 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 60 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: panel.fps as CFNumber)
-                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 80_000_000 as CFNumber)
-                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.92 as CFNumber)
-                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [15_000_000, 1.0] as CFArray)
+                if want444 {
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 80_000_000 as CFNumber)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.94 as CFNumber)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [15_000_000, 1.0] as CFArray)
+                } else {
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 60_000_000 as CFNumber)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.95 as CFNumber)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [12_000_000, 1.0] as CFArray)
+                }
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_ITU_R_709_2)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_YCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_601_4)
                 if VTCompressionSessionPrepareToEncodeFrames(session) == noErr {
                     activeCodec = "hevc"
                     encoder = session
+                    SenderLog.info("VideoToolbox encoder ready: negotiated=\(panel.codec), stream=\(activeCodec), hw=\(isUsingHardwareEncoder(session))")
                     return
                 }
                 VTCompressionSessionInvalidate(session)
                 created = nil
             }
         }
-        let h264Spec: CFDictionary = [
-            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: kCFBooleanTrue,
-            kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue
-        ] as CFDictionary
         var status = VTCompressionSessionCreate(
             allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264,
-            encoderSpecification: h264Spec, imageBufferAttributes: bgraAttrs, compressedDataAllocator: nil,
+            encoderSpecification: hwSpec, imageBufferAttributes: bgraAttrs, compressedDataAllocator: nil,
             outputCallback: nil, refcon: nil, compressionSessionOut: &created)
         if created == nil {
             status = VTCompressionSessionCreate(
@@ -371,14 +433,14 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         guard status == noErr, let created else { throw SenderError("VideoToolbox encoder is unavailable") }
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 60 as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: panel.fps as CFNumber)
-        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AverageBitRate, value: 45_000_000 as CFNumber)
-        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_DataRateLimits, value: [10_000_000, 1] as CFArray)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AverageBitRate, value: 60_000_000 as CFNumber)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_Quality, value: 0.94 as CFNumber)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_DataRateLimits, value: [12_000_000, 1.0] as CFArray)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_ITU_R_709_2)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_YCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_601_4)
@@ -388,6 +450,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         activeCodec = "h264"
         encoder = created
+        SenderLog.info("VideoToolbox encoder ready: negotiated=\(panel.codec), stream=\(activeCodec), hw=\(isUsingHardwareEncoder(created))")
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -573,6 +636,11 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.unlock()
         modeTask?.cancel(); modeTask = nil
         refineTimer?.cancel(); refineTimer = nil
+        if reconfigRegistered, let ctx = reconfigContext {
+            CGDisplayRemoveReconfigurationCallback(Self.displayReconfigurationCallback, ctx)
+            reconfigRegistered = false
+            reconfigContext = nil
+        }
         input?.cancel()
         input = nil
         stream?.stopCapture { _ in }

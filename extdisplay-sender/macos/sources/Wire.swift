@@ -18,6 +18,7 @@ enum Wire {
     static let pskSuite: UInt16 = 0x00A8
     static let alpn = "locachy-extdisplay-v1"
     static let capabilities = ["key", "button", "cancel", "pointer", "scroll"]
+    static let optionalCapabilities = ["touch", "tablet"]
 
     static func frame(_ payload: Data) throws -> Data {
         guard !payload.isEmpty, payload.count <= maxFrame else { throw SenderError("Invalid frame size") }
@@ -74,9 +75,14 @@ struct Panel: Equatable {
     let scale: Int
     let fps: Int
     let codec: String
+    let supportedInput: Set<String>
     let deviceName: String
     let hostName: String
     let machineModel: String
+
+    var streamCodec: String {
+        codec.hasPrefix("hevc") ? "hevc" : "h264"
+    }
 
     var identityKey: String {
         if !hostName.isEmpty || !machineModel.isEmpty {
@@ -109,6 +115,7 @@ struct Panel: Equatable {
               let input = hello["input"] as? [String], Set(Wire.capabilities).isSubset(of: Set(input)),
               let caps = hello["videoCaps"] as? [[String: Any]], !caps.isEmpty, caps.count <= 16
         else { throw SenderError("Receiver does not support the authenticated extended-display profile") }
+        supportedInput = Set(input)
         let device = Self.sanitizeLabel(hello["device"] as? String)
         deviceName = device.isEmpty ? "LOCachy" : device
         hostName = Self.sanitizeLabel(hello["host"] as? String)
@@ -116,39 +123,53 @@ struct Panel: Equatable {
         let panel = hello["panel"] as? [String: Any] ?? hello
         width = try Wire.integer(panel, panel["width"] == nil ? "pixelsWide" : "width", 64...4096)
         height = try Wire.integer(panel, panel["height"] == nil ? "pixelsHigh" : "height", 64...4096)
-        let requestedScale = try Wire.number(panel, "scale", 0.5...4)
-        // Compute virtual display geometry strictly from the receiver hello:
-        // use HiDPI @2x when @2x produces exact even points (1:1 physical pixels)
-        // and the receiver asked for >= 2x or has a high-density panel.
-        let exactHiDPI = width % 4 == 0 && height % 4 == 0
-        scale = (exactHiDPI && (requestedScale >= 2 || width >= 1600 || height >= 1000)) ? 2 : 1
+        _ = try Wire.number(panel, "scale", 0.5...4)
+        // Enable HiDPI (@2x) for any mainstream panel resolution; Capture.swift's
+        // Metal bicubic scaler handles arbitrary ratios cleanly.
+        scale = (max(width, height) >= 640 && min(width, height) >= 480) ? 2 : 1
         // VirtualCanvasSizing rounds to even points; capture verifies the
         // resulting mode and the receiver reads the real size from the SPS.
         guard width * height <= 16 * 1024 * 1024 else { throw SenderError("Panel is too large") }
         // The receiver always sends displayMaxFrameRate, but absence means the
         // legacy 60 Hz contract. H.264 level 5.2 caps macroblocks per second,
-        // so a large panel must lower its rate instead of relying on VT to
-        // silently reject output.
+        // so only H.264 lowers its rate via Panel.h264SafeRate.
         let requestedRate = hello["displayMaxFrameRate"] == nil ? 60
             : try Wire.integer(hello, "displayMaxFrameRate", 1...120)
-        fps = Panel.h264SafeRate(width: width, height: height, requested: min(60, requestedRate))
-        // Keep the first profile conservative and interoperable. HEVC is
-        // negotiated only when H.264 is absent, never sent without an offer.
-        // The capture path encodes H.264 only in this sender. A receiver
-        // that offers HEVC alone must not be answered with an H.264 stream
-        // labelled as anything else, so it is refused outright.
-        let offered = caps.compactMap { $0["codec"] as? String }
-        guard offered.contains("h264") else { throw SenderError("Receiver does not offer H.264") }
-        codec = offered.contains("hevc") ? "hevc" : "h264"
-        guard caps.contains(where: { capability in
-            guard capability["codec"] as? String == codec else { return false }
-            for (key, required) in [("maxWidth", width), ("maxHeight", height), ("maxFramesPerSecond", fps), ("maxFrameRate", fps)] {
-                if capability[key] != nil {
-                    guard let maximum = try? Wire.integer(capability, key, 1...Int.max), maximum >= required else { return false }
+        let panelW = width, panelH = height
+        let baseFps = min(60, requestedRate)
+        let priority = ["hevc444", "hevc", "hevc420", "h264"]
+        var negotiatedCodec: String?
+        var negotiatedFps = baseFps
+        for candidate in priority {
+            let candidateFps = candidate == "h264"
+                ? Panel.h264SafeRate(width: panelW, height: panelH, requested: baseFps)
+                : baseFps
+            let covered = caps.contains { capability in
+                guard capability["codec"] as? String == candidate else { return false }
+                for (key, required) in [("maxWidth", panelW), ("maxHeight", panelH),
+                                        ("maxFramesPerSecond", candidateFps), ("maxFrameRate", candidateFps)] {
+                    if capability[key] != nil {
+                        guard let maximum = try? Wire.integer(capability, key, 1...Int.max),
+                              maximum >= required else { return false }
+                    }
                 }
+                return true
             }
-            return true
-        }) else { throw SenderError("Panel exceeds the offered decoder envelope") }
+            if covered {
+                negotiatedCodec = candidate
+                negotiatedFps = candidateFps
+                break
+            }
+        }
+        guard let selectedCodec = negotiatedCodec else {
+            let offered = caps.compactMap { $0["codec"] as? String }
+            if offered.contains(where: { priority.contains($0) }) {
+                throw SenderError("Panel exceeds the offered decoder envelope")
+            }
+            throw SenderError("Receiver does not offer a supported video codec")
+        }
+        codec = selectedCodec
+        fps = negotiatedFps
     }
 }
 

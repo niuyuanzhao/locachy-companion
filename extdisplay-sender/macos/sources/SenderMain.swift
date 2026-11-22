@@ -70,7 +70,8 @@ final class Sender {
                     return
                 }
                 activePanel = panel
-                transport.sendObject(["type": "welcome", "locachy": 1, "extended": true, "input": Wire.capabilities])
+                let acceptedInput = Wire.capabilities + Wire.optionalCapabilities.filter { panel.supportedInput.contains($0) }
+                transport.sendObject(["type": "welcome", "locachy": 1, "extended": true, "input": acceptedInput])
                 let session = CaptureSession(transport: transport, panel: panel)
                 capture = session
                 startTask = Task { @MainActor in
@@ -85,7 +86,7 @@ final class Sender {
                 transport.sendObject(pong)
             case "kf": capture?.requestKeyframe()
             case "closing", "sleeping": finish("Receiver ended the session", code: 0)
-            case "key", "pointer", "button", "scroll", "cancel", "touch":
+            case "key", "pointer", "button", "scroll", "cancel", "touch", "tablet":
                 guard let capture else { return }
                 MainActor.assumeIsolated {
                     do { try capture.handleInput(object) }

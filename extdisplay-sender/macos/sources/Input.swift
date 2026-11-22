@@ -4,10 +4,15 @@ import Carbon
 import IOKit.pwr_mgt
 
 struct KeyIdentity: Hashable { let device: Int; let code: Int }
-// flags: the flags the key itself needs when pressed (layout shift/option,
-// and the held Command/Control). modifier: set when this key is a modifier, so
-// its own press shows it and its release clears it.
-struct MappedKey { let code: CGKeyCode; let text: String?; let flags: CGEventFlags; var modifier: CGEventFlags = [] }
+// flags: flags for the initial press; layoutFlags: only the Shift/Option
+// required by the resolved character, carried forward into autorepeat.
+struct MappedKey {
+    let code: CGKeyCode
+    let text: String?
+    let flags: CGEventFlags
+    var layoutFlags: CGEventFlags = []
+    var modifier: CGEventFlags = []
+}
 
 // Logical keys are resolved against the target's active Unicode keyboard layout,
 // not a hard-coded US map. Press-time mappings survive until the matching up.
@@ -83,11 +88,11 @@ enum KeyMapping {
                         let result = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), combination,
                             UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit), &state, chars.count, &length, &chars)
                         if result == noErr, length > 0, String(utf16CodeUnits: chars, count: length) == text {
-                            var mapped = flags
-                            mapped.remove([.maskShift, .maskAlternate, .maskAlphaShift])
-                            if combination & UInt32(shiftKey >> 8) != 0 { mapped.insert(.maskShift) }
-                            if combination & UInt32(optionKey >> 8) != 0 { mapped.insert(.maskAlternate) }
-                            return MappedKey(code: code, text: nil, flags: mapped)
+                            var layoutFlags: CGEventFlags = []
+                            if combination & UInt32(shiftKey >> 8) != 0 { layoutFlags.insert(.maskShift) }
+                            if combination & UInt32(optionKey >> 8) != 0 { layoutFlags.insert(.maskAlternate) }
+                            let mapped = flags.subtracting([.maskShift, .maskAlternate, .maskAlphaShift]).union(layoutFlags)
+                            return MappedKey(code: code, text: nil, flags: mapped, layoutFlags: layoutFlags)
                         }
                     }
                 }
@@ -104,10 +109,37 @@ enum KeyMapping {
 
 final class RemoteInput {
     typealias Sink = (CGEvent) -> Void
+
+    private struct TouchContact {
+        let id: Int
+        let startX: Double
+        let startY: Double
+        let startXmm: Double
+        let startYmm: Double
+        let startTime: TimeInterval
+        var x: Double
+        var y: Double
+        var xmm: Double
+        var ymm: Double
+        var maxTravelMm: Double = 0
+    }
+
+    private enum TouchGestureMode {
+        case idle
+        case singlePending(id: Int)
+        case singleDragging(id: Int)
+        case singleLongPressed(id: Int)
+        case twoPending(id1: Int, id2: Int, startDistMm: Double, startMidX: Double, startMidY: Double, startTime: TimeInterval)
+        case twoScrolling(lastMidPoint: CGPoint)
+        case twoPinching(anchorDistMm: Double, zoomStepAccum: Double)
+        case suppressed
+    }
+
     private let bounds: () -> CGRect
     private let displays: () -> [CGRect]
     private let live: Bool
     private let sink: Sink
+    private let now: () -> TimeInterval
     // A real HID-state source, as upstream InputInjector uses: menu tracking
     // treats sourceless synthetic clicks as malformed.
     private let source = CGEventSource(stateID: .hidSystemState)
@@ -129,6 +161,33 @@ final class RemoteInput {
     private var cachedBounds = CGRect.zero
     private var activityAssertion: IOPMAssertionID = 0
 
+    // Active stylus / pen-display state
+    private var tabletInProximity = false
+    private var tabletToolType: Int64 = 1 // 1 = pen, 3 = eraser
+    private var tabletDeviceID: Int64 = 1
+    private var tabletPointerID: Int64 = 1
+    private var tabletUniqueID: UInt64 = 0
+    private var tabletCaps: UInt32 = 0
+    private var tabletTipDown = false
+    private var tabletBarrelButtons = Set<Int>() // 331 (BTN_STYLUS), 332 (BTN_STYLUS2)
+    private var tabletPressure = 0.0
+    private var tabletTiltX = 0.0 // degrees
+    private var tabletTiltY = 0.0 // degrees
+    private var tabletDistance = 0.0
+    private var tabletRotation = 0.0
+    private var tabletLastNormX = 0.5
+    private var tabletLastNormY = 0.5
+
+    // Multi-touch touchscreen state
+    private var touchContacts: [Int: TouchContact] = [:]
+    private var touchMode: TouchGestureMode = .idle
+    private var touchScrollActive = false
+    private var touchScrollLastPoint = CGPoint.zero
+    private var touchScrollX = 0.0
+    private var touchScrollY = 0.0
+    private var touchLegacyDown = false
+    private var longPressTimer: DispatchSourceTimer?
+
     init(displayID: CGDirectDisplayID) {
         bounds = { CGDisplayBounds(displayID) }
         displays = {
@@ -139,42 +198,71 @@ final class RemoteInput {
             return rects.isEmpty ? [CGDisplayBounds(displayID)] : rects
         }
         live = true
+        now = { ProcessInfo.processInfo.systemUptime }
         sink = { event in
             guard AXIsProcessTrusted() else { return }
             event.post(tap: .cghidEventTap)
         }
     }
     // Unit tests create CGEvents but never post, query a display or request TCC.
-    init(bounds: @escaping () -> CGRect, sink: @escaping Sink) {
+    init(bounds: @escaping () -> CGRect,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         sink: @escaping Sink) {
         self.bounds = bounds
         self.displays = { [bounds()] }
         self.live = false
+        self.now = now
         self.sink = sink
     }
-    var heldCount: Int { held.count + buttons.count }
+
+    deinit {
+        disarmLongPress()
+    }
+
+    var heldCount: Int {
+        held.count + buttons.count + (tabletTipDown ? 1 : 0) + tabletBarrelButtons.count + (touchLegacyDown ? 1 : 0)
+    }
 
     func invalidateDisplayCache() {
         lastDisplayQueryTime = 0
     }
 
-    private func refreshDisplayCache(now: TimeInterval) {
-        if cachedBounds.isEmpty || cachedDisplays.isEmpty || now - lastDisplayQueryTime >= 1.0 {
-            lastDisplayQueryTime = now
+    private func refreshDisplayCache(now timestamp: TimeInterval) {
+        if cachedBounds.isEmpty || cachedDisplays.isEmpty || timestamp - lastDisplayQueryTime >= 1.0 {
+            lastDisplayQueryTime = timestamp
             cachedBounds = bounds()
             cachedDisplays = displays().filter { !$0.isEmpty }
         }
     }
 
-    private func point(_ object: [String: Any]) throws -> CGPoint {
-        let x = try Wire.number(object, "x", 0...1), y = try Wire.number(object, "y", 0...1)
-        if live { refreshDisplayCache(now: ProcessInfo.processInfo.systemUptime) }
+    private func activeVirtualBounds() throws -> CGRect {
+        if live { refreshDisplayCache(now: now()) }
         let rect = live && !cachedBounds.isEmpty ? cachedBounds : bounds()
         guard !rect.isEmpty else { throw SenderError("Virtual display is unavailable") }
+        return rect
+    }
+
+    // Strict virtual-display coordinate mapping for direct touchscreens and
+    // pen displays. Preserves sub-pixel precision and supports negative origins.
+    private func displayPoint(x: Double, y: Double) throws -> CGPoint {
+        let rect = try activeVirtualBounds()
+        let clampedX = min(max(x, 0.0), 1.0)
+        let clampedY = min(max(y, 0.0), 1.0)
+        let maxX = max(rect.minX, rect.maxX - 0.001)
+        let maxY = max(rect.minY, rect.maxY - 0.001)
+        let px = min(max(rect.minX + clampedX * rect.width, rect.minX), maxX)
+        let py = min(max(rect.minY + clampedY * rect.height, rect.minY), maxY)
+        return CGPoint(x: px, y: py)
+    }
+
+    private func point(_ object: [String: Any]) throws -> CGPoint {
+        let x = try Wire.number(object, "x", 0...1), y = try Wire.number(object, "y", 0...1)
+        let rect = try activeVirtualBounds()
         return CGPoint(x: rect.minX + x * max(0, rect.width - 1), y: rect.minY + y * max(0, rect.height - 1))
     }
 
     private func projectToDisplays(_ target: CGPoint) -> CGPoint {
-        refreshDisplayCache(now: ProcessInfo.processInfo.systemUptime)
+        refreshDisplayCache(now: now())
         let rects = cachedDisplays
         guard !rects.isEmpty else { return target }
         var best = target
@@ -191,10 +279,48 @@ final class RemoteInput {
         }
         return best
     }
+
+    private func deviceModifierFlags() -> CGEventFlags {
+        var raw: UInt64 = 0
+        for mapped in held.values {
+            switch mapped.code {
+            case 55: raw |= 0x08       // NX_DEVICELCMDKEYMASK
+            case 54: raw |= 0x10       // NX_DEVICERCMDKEYMASK
+            case 56: raw |= 0x02       // NX_DEVICELSHIFTKEYMASK
+            case 60: raw |= 0x04       // NX_DEVICERSHIFTKEYMASK
+            case 59: raw |= 0x01       // NX_DEVICELCTLKEYMASK
+            case 62: raw |= 0x2000     // NX_DEVICERCTLKEYMASK
+            case 58: raw |= 0x20       // NX_DEVICELALTKEYMASK
+            case 61: raw |= 0x40       // NX_DEVICERALTKEYMASK
+            default: break
+            }
+        }
+        return CGEventFlags(rawValue: raw)
+    }
+
+    private func eventFlags(_ semantic: CGEventFlags, flagsChanged: Bool = false) -> CGEventFlags {
+        let device = deviceModifierFlags()
+        var result = semantic.union(device)
+        let modifierFlags: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskAlphaShift]
+        if flagsChanged || !device.isEmpty || !semantic.intersection(modifierFlags).isEmpty {
+            result.insert(CGEventFlags(rawValue: 0x100)) // NX_NONCOALESCEDMASK
+        }
+        return result
+    }
+
+    private func releaseFlags(for mapped: MappedKey, from before: CGEventFlags) -> CGEventFlags {
+        guard !mapped.modifier.isEmpty else { return before }
+        if held.values.contains(where: { $0.modifier.contains(mapped.modifier) }) {
+            return before.union(mapped.modifier)
+        }
+        return before.subtracting(mapped.modifier)
+    }
+
     private func postKey(_ mapped: MappedKey, down: Bool, flags: CGEventFlags, repeatKey: Bool = false) {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: mapped.code, keyDown: down) else { return }
-        event.flags = flags
-        if KeyMapping.isModifier(mapped.code) { event.type = .flagsChanged }
+        let flagsChanged = KeyMapping.isModifier(mapped.code)
+        if flagsChanged { event.type = .flagsChanged }
+        event.flags = eventFlags(flags, flagsChanged: flagsChanged)
         event.setIntegerValueField(.keyboardEventAutorepeat, value: repeatKey ? 1 : 0)
         if let text = mapped.text {
             let utf16 = Array(text.utf16)
@@ -202,28 +328,707 @@ final class RemoteInput {
         }
         sink(event)
     }
-    private func mouse(_ button: Int, _ down: Bool, at point: CGPoint, cancelled: Bool = false) {
+
+    private func nextClickCount(for button: Int, at point: CGPoint, maxRadius: Double = 4) -> Int64 {
+        let currentTime = now(), previous = lastClickPoint[button] ?? point
+        let close = hypot(point.x - previous.x, point.y - previous.y) <= maxRadius
+        let soon = currentTime - (lastClickTime[button] ?? -100) <= NSEvent.doubleClickInterval
+        let count: Int64 = soon && close ? min(3, (clickCounts[button] ?? 0) + 1) : 1
+        clickCounts[button] = count
+        lastClickTime[button] = currentTime
+        lastClickPoint[button] = point
+        return count
+    }
+
+    private func mouse(_ button: Int, _ down: Bool, at point: CGPoint, cancelled: Bool = false, maxClickRadius: Double = 4) {
         let cgButton: CGMouseButton = button == 272 ? .left : button == 273 ? .right : .center
         let type: CGEventType = button == 272 ? (down ? .leftMouseDown : .leftMouseUp)
             : button == 273 ? (down ? .rightMouseDown : .rightMouseUp) : (down ? .otherMouseDown : .otherMouseUp)
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: cgButton) else { return }
-        if down {
-            let now = ProcessInfo.processInfo.systemUptime, previous = lastClickPoint[button] ?? point
-            let close = hypot(point.x - previous.x, point.y - previous.y) <= 4
-            let soon = now - (lastClickTime[button] ?? -100) <= NSEvent.doubleClickInterval
-            clickCounts[button] = soon && close ? min(3, (clickCounts[button] ?? 0) + 1) : 1
-            lastClickTime[button] = now; lastClickPoint[button] = point
+        let clickState: Int64
+        if cancelled {
+            clickState = 0
+        } else if down {
+            clickState = nextClickCount(for: button, at: point, maxRadius: maxClickRadius)
+        } else {
+            clickState = clickCounts[button] ?? 1
         }
-        event.flags = flags
-        event.setIntegerValueField(.mouseEventClickState, value: cancelled ? 0 : clickCounts[button] ?? 1)
+        event.flags = eventFlags(flags)
+        event.setIntegerValueField(.mouseEventClickState, value: clickState)
         sink(event)
     }
+
+    // MARK: - Active Stylus / Pen Display
+
+    private static func uint64Value(_ object: [String: Any], _ name: String) throws -> UInt64 {
+        guard let value = object[name] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else {
+            throw SenderError("Invalid \(name)")
+        }
+        if value.doubleValue < 0 || !value.doubleValue.isFinite {
+            throw SenderError("Invalid \(name)")
+        }
+        // Reject non-integer floating values when representable accurately in Double.
+        if value.doubleValue < 9007199254740992.0 && value.doubleValue.rounded() != value.doubleValue {
+            throw SenderError("Invalid \(name)")
+        }
+        return value.uint64Value
+    }
+
+    private static func uint32Value(_ object: [String: Any], _ name: String) throws -> UInt32 {
+        let v = try uint64Value(object, name)
+        guard v <= UInt64(UInt32.max) else { throw SenderError("Invalid \(name)") }
+        return UInt32(v)
+    }
+
+    private func currentTabletButtonMask() -> Int {
+        var mask = 0
+        if tabletTipDown { mask |= 1 }
+        if tabletBarrelButtons.contains(331) { mask |= 2 }
+        if tabletBarrelButtons.contains(332) { mask |= 4 }
+        return mask
+    }
+
+    private func tabletPointerType(for tool: String?) -> Int64 {
+        tool == "eraser" ? 3 : 1
+    }
+
+    private func applyTabletFields(_ event: CGEvent, normX: Double, normY: Double, pressure: Double, buttons: Int) {
+        let p = min(max(pressure, 0.0), 1.0)
+        let nx = min(max(normX, 0.0), 1.0)
+        let ny = min(max(normY, 0.0), 1.0)
+        let tx = min(max(tabletTiltX / 60.0, -1.0), 1.0)
+        let ty = min(max(tabletTiltY / 60.0, -1.0), 1.0)
+        event.setIntegerValueField(.mouseEventSubtype, value: Int64(CGEventMouseSubtype.tabletPoint.rawValue))
+        event.setDoubleValueField(.mouseEventPressure, value: p)
+        event.setDoubleValueField(.tabletEventPointPressure, value: p)
+        event.setDoubleValueField(.tabletEventTiltX, value: tx)
+        event.setDoubleValueField(.tabletEventTiltY, value: ty)
+        event.setIntegerValueField(.tabletEventPointX, value: Int64((nx * 65535.0).rounded()))
+        event.setIntegerValueField(.tabletEventPointY, value: Int64((ny * 65535.0).rounded()))
+        event.setIntegerValueField(.tabletEventPointButtons, value: Int64(buttons))
+        event.setIntegerValueField(.tabletEventDeviceID, value: tabletDeviceID)
+        event.setDoubleValueField(.tabletEventRotation, value: tabletRotation)
+        event.setIntegerValueField(.tabletEventPointZ, value: Int64((min(max(tabletDistance, 0.0), 1.0) * 65535.0).rounded()))
+    }
+
+    private static func quartzCapabilityMask(from receiverCaps: UInt32) -> Int64 {
+        // Map receiver POINTER_TABLET_CAP_* bits to IOLLEvent.h NX_TABLET_CAPABILITY_*.
+        var mask: Int64 = 0x0001 | 0x0002 | 0x0004 | 0x0040 // DEVICEID | ABSX | ABSY | BUTTONS
+        if receiverCaps & (1 << 0) != 0 { mask |= 0x0400 }          // PRESSURE
+        if receiverCaps & (1 << 1) != 0 { mask |= 0x0200 }          // ABSZ (distance)
+        if receiverCaps & (1 << 2) != 0 { mask |= 0x0080 | 0x0100 } // TILTX | TILTY
+        if receiverCaps & (1 << 3) != 0 { mask |= 0x2000 }          // ROTATION
+        return mask
+    }
+
+    private func postTabletProximity(enter: Bool, at point: CGPoint) {
+        guard let event = CGEvent(source: source) else { return }
+        event.type = .tabletProximity
+        event.location = point
+        event.flags = eventFlags(flags)
+        event.setIntegerValueField(.tabletProximityEventVendorID, value: 0x4C4F)
+        event.setIntegerValueField(.tabletProximityEventTabletID, value: 1)
+        event.setIntegerValueField(.tabletProximityEventPointerID, value: tabletPointerID)
+        event.setIntegerValueField(.tabletProximityEventDeviceID, value: tabletDeviceID)
+        event.setIntegerValueField(.tabletProximityEventSystemTabletID, value: 1)
+        event.setIntegerValueField(.tabletProximityEventVendorUniqueID, value: Int64(bitPattern: tabletUniqueID))
+        event.setIntegerValueField(.tabletProximityEventCapabilityMask, value: Self.quartzCapabilityMask(from: tabletCaps))
+        event.setIntegerValueField(.tabletProximityEventPointerType, value: tabletToolType)
+        event.setIntegerValueField(.tabletProximityEventEnterProximity, value: enter ? 1 : 0)
+        sink(event)
+    }
+
+    private func postTabletMouse(_ type: CGEventType, button: CGMouseButton, at point: CGPoint,
+                                 normX: Double, normY: Double, pressure: Double, buttons: Int,
+                                 clickState: Int64? = nil) {
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
+        event.flags = eventFlags(flags)
+        if let clickState {
+            event.setIntegerValueField(.mouseEventClickState, value: clickState)
+        }
+        applyTabletFields(event, normX: normX, normY: normY, pressure: pressure, buttons: buttons)
+        sink(event)
+    }
+
+    private func releaseHeldTabletInputs(at point: CGPoint, cancelled: Bool) {
+        if tabletTipDown {
+            tabletTipDown = false
+            tabletPressure = 0.0
+            let mask = currentTabletButtonMask()
+            postTabletMouse(.leftMouseUp, button: .left, at: point,
+                            normX: tabletLastNormX, normY: tabletLastNormY,
+                            pressure: 0.0, buttons: mask,
+                            clickState: cancelled ? 0 : (clickCounts[272] ?? 1))
+        }
+        if tabletBarrelButtons.remove(331) != nil {
+            let mask = currentTabletButtonMask()
+            postTabletMouse(.rightMouseUp, button: .right, at: point,
+                            normX: tabletLastNormX, normY: tabletLastNormY,
+                            pressure: tabletPressure, buttons: mask,
+                            clickState: cancelled ? 0 : (clickCounts[273] ?? 1))
+        }
+        if tabletBarrelButtons.remove(332) != nil {
+            let mask = currentTabletButtonMask()
+            postTabletMouse(.otherMouseUp, button: .center, at: point,
+                            normX: tabletLastNormX, normY: tabletLastNormY,
+                            pressure: tabletPressure, buttons: mask,
+                            clickState: cancelled ? 0 : (clickCounts[274] ?? 1))
+        }
+    }
+
+    private func handleTablet(_ object: [String: Any]) throws {
+        guard let kind = object["event"] as? String else { throw SenderError("Missing tablet event") }
+        let nx = object["x"] == nil ? tabletLastNormX : try Wire.number(object, "x", 0...1)
+        let ny = object["y"] == nil ? tabletLastNormY : try Wire.number(object, "y", 0...1)
+        let p = try displayPoint(x: nx, y: ny)
+        tabletLastNormX = nx
+        tabletLastNormY = ny
+
+        switch kind {
+        case "proximity":
+            let entering = try Wire.boolean(object, "in")
+            let tool = object["tool"] as? String
+            let newToolType = tabletPointerType(for: tool)
+            let newUniqueID = object["id"] == nil ? tabletUniqueID : try Self.uint64Value(object, "id")
+            let newCaps = object["caps"] == nil ? tabletCaps : try Self.uint32Value(object, "caps")
+
+            if entering {
+                if tabletInProximity && (tabletToolType != newToolType || tabletUniqueID != newUniqueID) {
+                    releaseHeldTabletInputs(at: p, cancelled: false)
+                    postTabletProximity(enter: false, at: p)
+                    tabletInProximity = false
+                }
+                tabletToolType = newToolType
+                tabletPointerID = newToolType
+                tabletUniqueID = newUniqueID
+                tabletCaps = newCaps
+                if !tabletInProximity {
+                    tabletInProximity = true
+                    postTabletProximity(enter: true, at: p)
+                }
+                lastPoint = p
+                hasLastPoint = true
+                postTabletMouse(.mouseMoved, button: .left, at: p,
+                                normX: nx, normY: ny, pressure: tabletPressure,
+                                buttons: currentTabletButtonMask())
+            } else {
+                releaseHeldTabletInputs(at: p, cancelled: false)
+                if tabletInProximity {
+                    postTabletProximity(enter: false, at: p)
+                    tabletInProximity = false
+                }
+                tabletPressure = 0.0
+                tabletTiltX = 0.0
+                tabletTiltY = 0.0
+                tabletDistance = 0.0
+                tabletRotation = 0.0
+                lastPoint = p
+                hasLastPoint = true
+            }
+
+        case "axis":
+            if object["pressure"] != nil { tabletPressure = try Wire.number(object, "pressure", 0...1) }
+            if object["tiltX"] != nil { tabletTiltX = try Wire.number(object, "tiltX", -90...90) }
+            if object["tiltY"] != nil { tabletTiltY = try Wire.number(object, "tiltY", -90...90) }
+            if object["distance"] != nil { tabletDistance = try Wire.number(object, "distance", 0...1) }
+            if object["rotation"] != nil { tabletRotation = try Wire.number(object, "rotation", -360...360) }
+            let btnMask = object["buttons"] == nil ? currentTabletButtonMask() : try Wire.integer(object, "buttons", 0...15)
+            let eventType: CGEventType
+            let cgButton: CGMouseButton
+            if tabletTipDown {
+                eventType = .leftMouseDragged
+                cgButton = .left
+            } else if tabletBarrelButtons.contains(331) {
+                eventType = .rightMouseDragged
+                cgButton = .right
+            } else if tabletBarrelButtons.contains(332) {
+                eventType = .otherMouseDragged
+                cgButton = .center
+            } else {
+                eventType = .mouseMoved
+                cgButton = .left
+            }
+            lastPoint = p
+            hasLastPoint = true
+            postTabletMouse(eventType, button: cgButton, at: p,
+                            normX: nx, normY: ny, pressure: tabletPressure, buttons: btnMask)
+
+        case "tip":
+            let down = try Wire.boolean(object, "down")
+            if object["pressure"] != nil { tabletPressure = try Wire.number(object, "pressure", 0...1) }
+            else if !down { tabletPressure = 0.0 }
+            let btnMask: Int
+            if object["buttons"] != nil {
+                btnMask = try Wire.integer(object, "buttons", 0...15)
+            } else {
+                btnMask = (down ? 1 : 0) | (tabletBarrelButtons.contains(331) ? 2 : 0) | (tabletBarrelButtons.contains(332) ? 4 : 0)
+            }
+            lastPoint = p
+            hasLastPoint = true
+            if down {
+                tabletTipDown = true
+                let clicks = nextClickCount(for: 272, at: p, maxRadius: 8)
+                postTabletMouse(.leftMouseDown, button: .left, at: p,
+                                normX: nx, normY: ny, pressure: tabletPressure,
+                                buttons: btnMask, clickState: clicks)
+            } else {
+                tabletTipDown = false
+                let clicks = clickCounts[272] ?? 1
+                postTabletMouse(.leftMouseUp, button: .left, at: p,
+                                normX: nx, normY: ny, pressure: tabletPressure,
+                                buttons: btnMask, clickState: clicks)
+            }
+
+        case "button":
+            let code = Int(try Self.uint32Value(object, "button"))
+            let state = try Wire.integer(object, "state", 0...1)
+            let down = state == 1
+            if object["pressure"] != nil { tabletPressure = try Wire.number(object, "pressure", 0...1) }
+            let mappedButton: (mouseCode: Int, cgButton: CGMouseButton, downType: CGEventType, upType: CGEventType)?
+            switch code {
+            case 331: mappedButton = (273, .right, .rightMouseDown, .rightMouseUp)
+            case 332: mappedButton = (274, .center, .otherMouseDown, .otherMouseUp)
+            default: mappedButton = nil
+            }
+            guard let mapped = mappedButton else { return }
+            let changed = down ? tabletBarrelButtons.insert(code).inserted : tabletBarrelButtons.remove(code) != nil
+            guard changed else { return }
+            let btnMask = object["buttons"] == nil ? currentTabletButtonMask() : try Wire.integer(object, "buttons", 0...15)
+            lastPoint = p
+            hasLastPoint = true
+            let clicks = down ? nextClickCount(for: mapped.mouseCode, at: p, maxRadius: 8) : (clickCounts[mapped.mouseCode] ?? 1)
+            postTabletMouse(down ? mapped.downType : mapped.upType, button: mapped.cgButton, at: p,
+                            normX: nx, normY: ny, pressure: tabletPressure,
+                            buttons: btnMask, clickState: clicks)
+
+        default:
+            throw SenderError("Invalid tablet event")
+        }
+    }
+
+    // MARK: - Multi-Touch Touchscreen
+
+    private static let tapMaxTravelMm = 4.0
+    private static let dragMinTravelMm = 3.5
+    private static let singleTapMaxDuration = 0.45
+    private static let longPressDuration = 0.50
+    private static let twoFingerTapMaxDuration = 0.30
+    private static let pinchMinDeltaMm = 4.0
+    private static let pinchMinRatioChange = 0.06
+    private static let pinchStepRatio = 0.12
+    private static let scrollMinTravelMm = 3.5
+
+    private func armLongPress(for id: Int) {
+        disarmLongPress()
+        guard live else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.longPressDuration)
+        timer.setEventHandler { [weak self] in
+            self?.tickLongPress()
+        }
+        timer.resume()
+        longPressTimer = timer
+    }
+
+    private func disarmLongPress() {
+        longPressTimer?.cancel()
+        longPressTimer = nil
+    }
+
+    // Evaluates whether a pending 1-finger hold has crossed the long-press
+    // threshold. Invoked by the DispatchSourceTimer in live mode and directly
+    // by deterministic unit tests with an injected clock.
+    func tickLongPress() {
+        guard case .singlePending(let id) = touchMode,
+              let contact = touchContacts[id],
+              touchContacts.count == 1 else {
+            disarmLongPress()
+            return
+        }
+        guard contact.maxTravelMm < Self.tapMaxTravelMm,
+              now() - contact.startTime >= Self.longPressDuration else { return }
+        disarmLongPress()
+        guard let p = try? displayPoint(x: contact.startX, y: contact.startY) else { return }
+        lastPoint = p
+        hasLastPoint = true
+        touchMode = .singleLongPressed(id: id)
+        mouse(273, true, at: p, maxClickRadius: 16)
+        mouse(273, false, at: p, maxClickRadius: 16)
+    }
+
+    private func endTouchScroll(cancelled: Bool) {
+        guard touchScrollActive else { return }
+        postScroll(wheelX: 0, wheelY: 0, pointX: 0, pointY: 0,
+                   phase: cancelled ? 8 : 4, continuous: 1, at: touchScrollLastPoint)
+        touchScrollActive = false
+        touchScrollX = 0
+        touchScrollY = 0
+    }
+
+    private func postZoomStep(zoomIn: Bool) {
+        // US ANSI keycodes: 24 = Equal/Plus, 27 = Minus. Standard Command+/Command-
+        // zoom works across Safari, Chrome, Preview, Finder, Freeform, Notes, Figma, VS Code.
+        let code: CGKeyCode = zoomIn ? 24 : 27
+        let zoomFlags = flags.union(.maskCommand)
+        if let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true) {
+            down.flags = eventFlags(zoomFlags)
+            sink(down)
+        }
+        if let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) {
+            up.flags = eventFlags(zoomFlags)
+            sink(up)
+        }
+    }
+
+    private func cancelTouch(fromTouchCancel: Bool) {
+        disarmLongPress()
+        if case .singleDragging = touchMode {
+            mouse(272, false, at: lastPoint, cancelled: true)
+        }
+        endTouchScroll(cancelled: true)
+        if touchLegacyDown {
+            touchLegacyDown = false
+            mouse(272, false, at: lastPoint, cancelled: true)
+        }
+        touchContacts.removeAll()
+        touchMode = fromTouchCancel ? .idle : .idle
+    }
+
+    private func fallbackMm(x: Double, y: Double, rect: CGRect) -> (Double, Double) {
+        // Fallback physical coordinates (assuming ~110 ppi logical points -> ~0.23 mm/pt)
+        // when a frame omits xmm/ymm.
+        return (x * rect.width * 0.23, y * rect.height * 0.23)
+    }
+
+    private func handleTouchFrame(_ object: [String: Any], scrollScale: Double) throws {
+        guard let rawPoints = object["points"] as? [[String: Any]] else {
+            throw SenderError("Missing touch points")
+        }
+        let rect = try activeVirtualBounds()
+        let timestamp = now()
+        var sawCancel = false
+        var endedIDs: [Int] = []
+        var endedSnapshots: [Int: TouchContact] = [:]
+
+        for entry in rawPoints {
+            let id = try Wire.integer(entry, "id", 0...Int(Int32.max))
+            guard let state = entry["state"] as? String else { throw SenderError("Invalid touch point state") }
+            switch state {
+            case "cancel":
+                sawCancel = true
+            case "down":
+                let x = try Wire.number(entry, "x", 0...1)
+                let y = try Wire.number(entry, "y", 0...1)
+                let fallback = fallbackMm(x: x, y: y, rect: rect)
+                let xmm = entry["xmm"] == nil ? fallback.0 : try Wire.number(entry, "xmm", -10000...10000)
+                let ymm = entry["ymm"] == nil ? fallback.1 : try Wire.number(entry, "ymm", -10000...10000)
+                touchContacts[id] = TouchContact(
+                    id: id, startX: x, startY: y, startXmm: xmm, startYmm: ymm,
+                    startTime: timestamp, x: x, y: y, xmm: xmm, ymm: ymm, maxTravelMm: 0
+                )
+            case "move":
+                let x = try Wire.number(entry, "x", 0...1)
+                let y = try Wire.number(entry, "y", 0...1)
+                let fallback = fallbackMm(x: x, y: y, rect: rect)
+                let xmm = entry["xmm"] == nil ? fallback.0 : try Wire.number(entry, "xmm", -10000...10000)
+                let ymm = entry["ymm"] == nil ? fallback.1 : try Wire.number(entry, "ymm", -10000...10000)
+                if var contact = touchContacts[id] {
+                    contact.x = x
+                    contact.y = y
+                    contact.xmm = xmm
+                    contact.ymm = ymm
+                    let travel = hypot(xmm - contact.startXmm, ymm - contact.startYmm)
+                    if travel > contact.maxTravelMm { contact.maxTravelMm = travel }
+                    touchContacts[id] = contact
+                } else {
+                    touchContacts[id] = TouchContact(
+                        id: id, startX: x, startY: y, startXmm: xmm, startYmm: ymm,
+                        startTime: timestamp, x: x, y: y, xmm: xmm, ymm: ymm, maxTravelMm: 0
+                    )
+                }
+            case "up":
+                if var contact = touchContacts.removeValue(forKey: id) {
+                    if entry["x"] != nil && entry["y"] != nil {
+                        let x = try Wire.number(entry, "x", 0...1)
+                        let y = try Wire.number(entry, "y", 0...1)
+                        let fallback = fallbackMm(x: x, y: y, rect: rect)
+                        let xmm = entry["xmm"] == nil ? fallback.0 : try Wire.number(entry, "xmm", -10000...10000)
+                        let ymm = entry["ymm"] == nil ? fallback.1 : try Wire.number(entry, "ymm", -10000...10000)
+                        contact.x = x
+                        contact.y = y
+                        contact.xmm = xmm
+                        contact.ymm = ymm
+                        let travel = hypot(xmm - contact.startXmm, ymm - contact.startYmm)
+                        if travel > contact.maxTravelMm { contact.maxTravelMm = travel }
+                    }
+                    endedIDs.append(id)
+                    endedSnapshots[id] = contact
+                }
+            default:
+                throw SenderError("Invalid touch point state")
+            }
+        }
+
+        if sawCancel {
+            cancelTouch(fromTouchCancel: true)
+            return
+        }
+
+        let activeCount = touchContacts.count
+
+        // Handle transitions out of active gestures when finger count changes.
+        if activeCount >= 3 {
+            disarmLongPress()
+            if case .singleDragging = touchMode {
+                mouse(272, false, at: lastPoint, cancelled: true)
+            }
+            endTouchScroll(cancelled: false)
+            touchMode = .suppressed
+            return
+        }
+
+        switch touchMode {
+        case .idle:
+            if activeCount == 1, let c = touchContacts.values.first {
+                touchMode = .singlePending(id: c.id)
+                armLongPress(for: c.id)
+            } else if activeCount == 2 {
+                enterTwoFingerPending(timestamp: timestamp)
+            } else if activeCount == 0 && endedIDs.count == 1, let c = endedSnapshots[endedIDs[0]] {
+                // Single-frame down+up tap
+                if c.maxTravelMm < Self.tapMaxTravelMm && timestamp - c.startTime < Self.singleTapMaxDuration {
+                    let p = try displayPoint(x: c.startX, y: c.startY)
+                    lastPoint = p
+                    hasLastPoint = true
+                    mouse(272, true, at: p, maxClickRadius: 20)
+                    mouse(272, false, at: p, maxClickRadius: 20)
+                }
+            }
+
+        case .singlePending(let id):
+            if activeCount == 2 {
+                disarmLongPress()
+                enterTwoFingerPending(timestamp: timestamp)
+            } else if activeCount == 1, let c = touchContacts[id] {
+                if c.maxTravelMm >= Self.dragMinTravelMm {
+                    disarmLongPress()
+                    let p0 = try displayPoint(x: c.startX, y: c.startY)
+                    let p = try displayPoint(x: c.x, y: c.y)
+                    touchMode = .singleDragging(id: id)
+                    lastPoint = p0
+                    hasLastPoint = true
+                    mouse(272, true, at: p0, maxClickRadius: 20)
+                    postTouchDrag(to: p)
+                } else if timestamp - c.startTime >= Self.longPressDuration {
+                    tickLongPress()
+                }
+            } else if activeCount == 0 {
+                disarmLongPress()
+                touchMode = .idle
+                if let c = endedSnapshots[id] {
+                    if c.maxTravelMm < Self.tapMaxTravelMm && timestamp - c.startTime < Self.singleTapMaxDuration {
+                        let p = try displayPoint(x: c.startX, y: c.startY)
+                        lastPoint = p
+                        hasLastPoint = true
+                        mouse(272, true, at: p, maxClickRadius: 20)
+                        mouse(272, false, at: p, maxClickRadius: 20)
+                    } else if c.maxTravelMm >= Self.dragMinTravelMm {
+                        let p0 = try displayPoint(x: c.startX, y: c.startY)
+                        let p = try displayPoint(x: c.x, y: c.y)
+                        lastPoint = p0
+                        hasLastPoint = true
+                        mouse(272, true, at: p0, maxClickRadius: 20)
+                        postTouchDrag(to: p)
+                        mouse(272, false, at: p, maxClickRadius: 20)
+                    }
+                }
+            } else {
+                disarmLongPress()
+                touchMode = .suppressed
+            }
+
+        case .singleDragging(let id):
+            if let c = touchContacts[id] {
+                if activeCount == 1 {
+                    let p = try displayPoint(x: c.x, y: c.y)
+                    postTouchDrag(to: p)
+                } else {
+                    // Second finger joined mid-drag: end drag cleanly, suppress until release.
+                    let p = try displayPoint(x: c.x, y: c.y)
+                    lastPoint = p
+                    hasLastPoint = true
+                    mouse(272, false, at: p, maxClickRadius: 20)
+                    touchMode = .suppressed
+                }
+            } else {
+                let endPoint: CGPoint
+                if let c = endedSnapshots[id] {
+                    endPoint = try displayPoint(x: c.x, y: c.y)
+                } else {
+                    endPoint = lastPoint
+                }
+                lastPoint = endPoint
+                hasLastPoint = true
+                mouse(272, false, at: endPoint, maxClickRadius: 20)
+                touchMode = activeCount == 0 ? .idle : .suppressed
+            }
+
+        case .singleLongPressed:
+            if activeCount == 0 {
+                touchMode = .idle
+            }
+
+        case .twoPending(let id1, let id2, let startDistMm, let startMidX, let startMidY, let startTime):
+            if activeCount == 2, let c1 = touchContacts[id1], let c2 = touchContacts[id2] {
+                let distMm = hypot(c2.xmm - c1.xmm, c2.ymm - c1.ymm)
+                let distDelta = abs(distMm - startDistMm)
+                let ratioChange = startDistMm > 1.0 ? distDelta / startDistMm : 0.0
+                let midXmm = (c1.xmm + c2.xmm) * 0.5
+                let midYmm = (c1.ymm + c2.ymm) * 0.5
+                let startMidXmm = (c1.startXmm + c2.startXmm) * 0.5
+                let startMidYmm = (c1.startYmm + c2.startYmm) * 0.5
+                let midTravelMm = hypot(midXmm - startMidXmm, midYmm - startMidYmm)
+                let midNormX = (c1.x + c2.x) * 0.5
+                let midNormY = (c1.y + c2.y) * 0.5
+                let midPoint = try displayPoint(x: midNormX, y: midNormY)
+                let startMidPoint = try displayPoint(x: startMidX, y: startMidY)
+
+                let isPinch = distDelta >= Self.pinchMinDeltaMm && (startDistMm <= 1.0 || ratioChange >= Self.pinchMinRatioChange)
+                if isPinch && distDelta >= midTravelMm {
+                    let safeAnchor = max(startDistMm, 1.0)
+                    let logScale = log(max(distMm, 1.0) / safeAnchor)
+                    let stepLog = log(1.0 + Self.pinchStepRatio)
+                    var accum = logScale / stepLog
+                    while accum >= 1.0 {
+                        postZoomStep(zoomIn: true)
+                        accum -= 1.0
+                    }
+                    while accum <= -1.0 {
+                        postZoomStep(zoomIn: false)
+                        accum += 1.0
+                    }
+                    touchMode = .twoPinching(anchorDistMm: max(distMm, 1.0), zoomStepAccum: accum)
+                } else if midTravelMm >= Self.scrollMinTravelMm {
+                    lastPoint = startMidPoint
+                    hasLastPoint = true
+                    if let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: startMidPoint, mouseButton: .left) {
+                        move.flags = eventFlags(flags)
+                        sink(move)
+                    }
+                    touchScrollActive = true
+                    touchScrollLastPoint = startMidPoint
+                    touchScrollX = 0
+                    touchScrollY = 0
+                    postScroll(wheelX: 0, wheelY: 0, pointX: 0, pointY: 0, phase: 1, continuous: 1, at: startMidPoint)
+                    emitTouchScrollDelta(from: startMidPoint, to: midPoint, scrollScale: scrollScale)
+                    touchMode = .twoScrolling(lastMidPoint: midPoint)
+                }
+            } else {
+                // One or both fingers lifted while in twoPending.
+                let c1 = touchContacts[id1] ?? endedSnapshots[id1]
+                let c2 = touchContacts[id2] ?? endedSnapshots[id2]
+                let withinTravel = (c1?.maxTravelMm ?? 0) < Self.tapMaxTravelMm && (c2?.maxTravelMm ?? 0) < Self.tapMaxTravelMm
+                let withinDuration = timestamp - startTime < Self.twoFingerTapMaxDuration
+                if withinTravel && withinDuration {
+                    let midPoint = try displayPoint(x: startMidX, y: startMidY)
+                    lastPoint = midPoint
+                    hasLastPoint = true
+                    mouse(273, true, at: midPoint, maxClickRadius: 20)
+                    mouse(273, false, at: midPoint, maxClickRadius: 20)
+                }
+                touchMode = activeCount == 0 ? .idle : .suppressed
+            }
+
+        case .twoScrolling(let lastMidPoint):
+            if activeCount == 2 {
+                let pts = Array(touchContacts.values)
+                let midPoint = try displayPoint(x: (pts[0].x + pts[1].x) * 0.5, y: (pts[0].y + pts[1].y) * 0.5)
+                emitTouchScrollDelta(from: lastMidPoint, to: midPoint, scrollScale: scrollScale)
+                touchMode = .twoScrolling(lastMidPoint: midPoint)
+            } else {
+                endTouchScroll(cancelled: false)
+                touchMode = activeCount == 0 ? .idle : .suppressed
+            }
+
+        case .twoPinching(let anchorDistMm, var accum):
+            if activeCount == 2 {
+                let pts = Array(touchContacts.values)
+                let distMm = max(hypot(pts[1].xmm - pts[0].xmm, pts[1].ymm - pts[0].ymm), 1.0)
+                let stepLog = log(1.0 + Self.pinchStepRatio)
+                accum += log(distMm / max(anchorDistMm, 1.0)) / stepLog
+                while accum >= 1.0 {
+                    postZoomStep(zoomIn: true)
+                    accum -= 1.0
+                }
+                while accum <= -1.0 {
+                    postZoomStep(zoomIn: false)
+                    accum += 1.0
+                }
+                touchMode = .twoPinching(anchorDistMm: distMm, zoomStepAccum: accum)
+            } else {
+                touchMode = activeCount == 0 ? .idle : .suppressed
+            }
+
+        case .suppressed:
+            if activeCount == 0 {
+                touchMode = .idle
+            }
+        }
+    }
+
+    private func enterTwoFingerPending(timestamp: TimeInterval) {
+        let sorted = touchContacts.values.sorted { $0.id < $1.id }
+        guard sorted.count == 2 else { touchMode = .suppressed; return }
+        let c1 = sorted[0], c2 = sorted[1]
+        let distMm = hypot(c2.xmm - c1.xmm, c2.ymm - c1.ymm)
+        let midX = (c1.x + c2.x) * 0.5
+        let midY = (c1.y + c2.y) * 0.5
+        let startTime = min(c1.startTime, c2.startTime)
+        touchMode = .twoPending(id1: c1.id, id2: c2.id, startDistMm: distMm, startMidX: midX, startMidY: midY, startTime: min(startTime, timestamp))
+    }
+
+    private func postTouchDrag(to point: CGPoint) {
+        let dx = point.x - lastPoint.x
+        let dy = point.y - lastPoint.y
+        lastPoint = point
+        hasLastPoint = true
+        if let event = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: point, mouseButton: .left) {
+            event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
+            event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+            event.flags = eventFlags(flags)
+            sink(event)
+        }
+    }
+
+    private func emitTouchScrollDelta(from previous: CGPoint, to current: CGPoint, scrollScale: Double) {
+        let scale = (scrollScale.isFinite && scrollScale > 0 && scrollScale <= 4) ? scrollScale : 1.0
+        // Natural direction: dragging fingers up (negative dy) pushes content up (negative scroll delta in pixel coords -> wait:
+        // on macOS CGEvent scrollWheel with pixel units, positive wheel1/pointDeltaAxis1 scrolls content down / moves viewport up,
+        // matching dragging fingers downward -> positive dy).
+        let dx = (current.x - previous.x) * scale
+        let dy = (current.y - previous.y) * scale
+        touchScrollLastPoint = current
+        lastPoint = current
+        hasLastPoint = true
+        touchScrollX += dx
+        touchScrollY += dy
+        let ix = touchScrollX.rounded(.towardZero)
+        let iy = touchScrollY.rounded(.towardZero)
+        touchScrollX -= ix
+        touchScrollY -= iy
+        if dx != 0 || dy != 0 {
+            postScroll(wheelX: Int32(ix), wheelY: Int32(iy), pointX: dx, pointY: dy, phase: 2, continuous: 1, at: current)
+        }
+    }
+
+    // MARK: - Dispatch
+
     func handle(_ object: [String: Any], scrollScale: Double = 1) throws {
         guard let type = object["type"] as? String else { throw SenderError("Missing input type") }
         if live {
-            let now = ProcessInfo.processInfo.systemUptime
-            if now - lastActivityTime >= 1.0 {
-                lastActivityTime = now
+            let currentTime = now()
+            if currentTime - lastActivityTime >= 1.0 {
+                lastActivityTime = currentTime
                 IOPMAssertionDeclareUserActivity("LOCachy Remote Input" as CFString, kIOPMUserActiveLocal, &activityAssertion)
             }
         }
@@ -233,44 +1038,44 @@ final class RemoteInput {
             let state = try Wire.integer(object, "state", 0...2)
             let modifiers = try Wire.integer(object, "modifiers", 0...127), locks = try Wire.integer(object, "locks", 0...3)
             guard object["mapping"] as? String == "logical" else { throw SenderError("Unsupported keyboard mapping") }
-            // Modifiers and locks are the state before this event. A modifier
-            // key's own transition is applied on top of it, so its press shows
-            // the modifier and its release clears it. Reporting the state after
-            // the event would give the same result, since both are idempotent.
-            var before = KeyMapping.flags(modifiers, locks)
+            // The wire reports the state before the event. Apply the key's
+            // own transition on top of it for flagsChanged events.
+            let before = KeyMapping.flags(modifiers, locks)
             if state == 0 {
                 guard let mapped = held.removeValue(forKey: identity) else { return }
-                before.subtract(mapped.modifier)
-                flags = before
+                flags = releaseFlags(for: mapped, from: before)
                 // Multiple physical keyboards may hold the same logical key.
                 if !held.values.contains(where: { $0.code == mapped.code && $0.text == mapped.text }) {
-                    postKey(mapped, down: false, flags: before)
+                    postKey(mapped, down: false, flags: flags)
                 }
             } else if state == 2 {
-                if let mapped = held[identity] {
-                    postKey(mapped, down: true, flags: mapped.flags.union(mapped.modifier), repeatKey: true)
-                }
+                guard let mapped = held[identity], !KeyMapping.isModifier(mapped.code) else { return }
+                flags = before
+                postKey(mapped, down: true, flags: before.union(mapped.layoutFlags), repeatKey: true)
             } else {
                 if let prev = held.removeValue(forKey: identity) {
-                    var releaseFlags = before
-                    releaseFlags.subtract(prev.modifier)
-                    postKey(prev, down: false, flags: releaseFlags)
+                    postKey(prev, down: false, flags: releaseFlags(for: prev, from: before))
                 }
                 guard held.count < 128 else { throw SenderError("Too many held keys") }
                 let sym = UInt32(try Wire.integer(object, "keysym", 0...Int(UInt32.max)))
                 if sym == 0 { return }
                 var mapped = try KeyMapping.logical(sym, flags: before)
                 mapped.modifier = KeyMapping.modifierBit(sym)
-                flags = before.union(mapped.modifier)
                 held[identity] = mapped
-                postKey(mapped, down: true, flags: mapped.flags.union(mapped.modifier))
+                flags = before.union(mapped.modifier)
+                if mapped.code == 57 { // Caps Lock toggles only on its press.
+                    flags.formSymmetricDifference(.maskAlphaShift)
+                    postKey(mapped, down: true, flags: flags)
+                } else {
+                    postKey(mapped, down: true, flags: mapped.flags.union(mapped.modifier))
+                }
             }
         case "pointer":
             let mapped = try point(object)
             let x = try Wire.number(object, "x", 0...1), y = try Wire.number(object, "y", 0...1)
-            let now = ProcessInfo.processInfo.systemUptime
-            let syncCursor = !hasLastPoint || (live && now - lastPointerTime > 0.3)
-            lastPointerTime = now
+            let currentTime = now()
+            let syncCursor = !hasLastPoint || (live && currentTime - lastPointerTime > 0.3)
+            lastPointerTime = currentTime
             var dx = 0.0, dy = 0.0
             if object["dx"] != nil || object["dy"] != nil {
                 dx = object["dx"] == nil ? 0 : try Wire.number(object, "dx", -16384...16384)
@@ -302,11 +1107,11 @@ final class RemoteInput {
             }
             let button = buttons.contains(272) ? 272 : buttons.contains(273) ? 273 : 274
             let cgButton: CGMouseButton = button == 272 ? .left : button == 273 ? .right : .center
-            let type: CGEventType = buttons.isEmpty ? .mouseMoved : button == 272 ? .leftMouseDragged : button == 273 ? .rightMouseDragged : .otherMouseDragged
-            if let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: lastPoint, mouseButton: cgButton) {
+            let eventType: CGEventType = buttons.isEmpty ? .mouseMoved : button == 272 ? .leftMouseDragged : button == 273 ? .rightMouseDragged : .otherMouseDragged
+            if let event = CGEvent(mouseEventSource: source, mouseType: eventType, mouseCursorPosition: lastPoint, mouseButton: cgButton) {
                 event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
                 event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
-                event.flags = flags; sink(event)
+                event.flags = eventFlags(flags); sink(event)
             }
         case "button":
             let button = try Wire.integer(object, "button", 272...274), down = try Wire.integer(object, "state", 0...1) == 1
@@ -318,14 +1123,43 @@ final class RemoteInput {
                 lastPoint = current
             }
             if down ? buttons.insert(button).inserted : buttons.remove(button) != nil { mouse(button, down, at: lastPoint) }
+        case "tablet":
+            try handleTablet(object)
         case "touch":
             let phase = object["phase"] as? String
+            if phase == "frame" {
+                try handleTouchFrame(object, scrollScale: scrollScale)
+                return
+            }
             guard ["began", "moved", "ended", "cancelled"].contains(phase ?? "") else { throw SenderError("Invalid touch phase") }
-            let p = try point(object)
-            if phase == "moved" { try handle(["type": "pointer", "x": object["x"]!, "y": object["y"]!]) }
-            else if phase == "began" { if buttons.insert(272).inserted { mouse(272, true, at: p) } }
-            else if buttons.remove(272) != nil { mouse(272, false, at: p, cancelled: phase == "cancelled") }
-            lastPoint = p
+            let nx = try Wire.number(object, "x", 0...1), ny = try Wire.number(object, "y", 0...1)
+            let p = try displayPoint(x: nx, y: ny)
+            if phase == "began" {
+                lastPoint = p
+                hasLastPoint = true
+                if !touchLegacyDown {
+                    touchLegacyDown = true
+                    mouse(272, true, at: p)
+                }
+            } else if phase == "moved" {
+                if touchLegacyDown {
+                    postTouchDrag(to: p)
+                } else {
+                    lastPoint = p
+                    hasLastPoint = true
+                    if let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: p, mouseButton: .left) {
+                        event.flags = eventFlags(flags)
+                        sink(event)
+                    }
+                }
+            } else {
+                lastPoint = p
+                hasLastPoint = true
+                if touchLegacyDown {
+                    touchLegacyDown = false
+                    mouse(272, false, at: p, cancelled: phase == "cancelled")
+                }
+            }
         case "scroll":
             guard scrollScale.isFinite, scrollScale > 0, scrollScale <= 4 else { throw SenderError("Invalid scroll scale") }
             // Receiver phase: 0 none (discrete), 1 begin, 2 update, 3 end,
@@ -363,10 +1197,15 @@ final class RemoteInput {
         default: break
         }
     }
-    private func postScroll(wheelX: Int32, wheelY: Int32, pointX: Double, pointY: Double, phase: Int64, continuous: Int64) {
+
+    private func postScroll(wheelX: Int32, wheelY: Int32, pointX: Double, pointY: Double,
+                            phase: Int64, continuous: Int64, at location: CGPoint? = nil) {
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
                                   wheel1: wheelY, wheel2: wheelX, wheel3: 0) else { return }
-        event.flags = flags
+        if let location {
+            event.location = location
+        }
+        event.flags = eventFlags(flags)
         event.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: pointY)
         event.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: pointX)
         event.setIntegerValueField(.scrollWheelEventIsContinuous, value: continuous)
@@ -379,12 +1218,24 @@ final class RemoteInput {
         // phantom trackpad gesture alive after focus loss or teardown.
         if scrollActive { postScroll(wheelX: 0, wheelY: 0, pointX: 0, pointY: 0, phase: 8, continuous: 1) }
         scrollActive = false
+        cancelTouch(fromTouchCancel: false)
+        releaseHeldTabletInputs(at: lastPoint, cancelled: true)
+        if tabletInProximity {
+            postTabletProximity(enter: false, at: lastPoint)
+            tabletInProximity = false
+        }
+        tabletPressure = 0.0
+        tabletTiltX = 0.0
+        tabletTiltY = 0.0
+        tabletDistance = 0.0
+        tabletRotation = 0.0
         flags = []
+        let cancelledKeys = held
+        held.removeAll()
         var released = Set<CGKeyCode>()
-        for mapped in held.values where released.insert(mapped.code).inserted {
+        for mapped in cancelledKeys.values where released.insert(mapped.code).inserted {
             postKey(mapped, down: false, flags: [])
         }
-        held.removeAll()
         for button in buttons { mouse(button, false, at: lastPoint, cancelled: true) }
         buttons.removeAll()
         scrollX = 0; scrollY = 0
