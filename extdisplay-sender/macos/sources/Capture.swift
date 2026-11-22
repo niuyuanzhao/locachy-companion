@@ -17,7 +17,7 @@ enum SenderLog {
 final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let transport: SecureTransport
     private let panel: Panel
-    private let sampleQueue = DispatchQueue(label: "locachy.macos.capture")
+    private let sampleQueue = DispatchQueue(label: "locachy.macos.capture", qos: .userInteractive)
     let inputQueue: DispatchQueue
     private let lock = NSLock()
     private var display: VirtualDisplay?
@@ -45,6 +45,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var captureHeight = 0
     private var sleepAssertion: IOPMAssertionID = 0
     private var wakeAssertion: IOPMAssertionID = 0
+    private var activityToken: NSObjectProtocol?
+    private var consecutiveEncodeErrors = 0
     private var reconfigRegistered = false
     private var reconfigContext: UnsafeMutableRawPointer?
     private lazy var ciContext: CIContext? = {
@@ -97,6 +99,10 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
             "LOCachy Extended Display" as CFString,
             &sleepAssertion)
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical],
+            reason: "LOCachy Extended Display streaming"
+        )
         if !CGPreflightScreenCaptureAccess() {
             _ = CGRequestScreenCaptureAccess()
         }
@@ -437,6 +443,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                                          value: kVTProfileLevel_HEVC_Main_AutoLevel)
                 }
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
@@ -445,14 +452,14 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 if want444 {
                     VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 80_000_000 as CFNumber)
                     VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.94 as CFNumber)
-                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [15_000_000, 1.0] as CFArray)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [16_000_000, 1.0] as CFArray)
                 } else {
-                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 60_000_000 as CFNumber)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 80_000_000 as CFNumber)
                     VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality, value: 0.95 as CFNumber)
-                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [12_000_000, 1.0] as CFArray)
+                    VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [16_000_000, 1.0] as CFArray)
                 }
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
-                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_ITU_R_709_2)
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_sRGB)
                 VTSessionSetProperty(session, key: kVTCompressionPropertyKey_YCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
                 if VTCompressionSessionPrepareToEncodeFrames(session) == noErr {
                     activeCodec = "hevc"
@@ -476,6 +483,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
         guard status == noErr, let created else { throw SenderError("VideoToolbox encoder is unavailable") }
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
@@ -486,7 +494,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_Quality, value: 0.94 as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_DataRateLimits, value: [12_000_000, 1.0] as CFArray)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
-        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_ITU_R_709_2)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_sRGB)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_YCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
         guard VTCompressionSessionPrepareToEncodeFrames(created) == noErr else {
             VTCompressionSessionInvalidate(created)
@@ -616,17 +624,58 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoder, imageBuffer: encodeImage, presentationTimeStamp: pts,
             duration: .invalid, frameProperties: properties, infoFlagsOut: nil
         ) { [weak self] status, _, output in self?.encoded(status: status, sample: output) }
-        if status != noErr { finishEncode(failed: true) }
+        if status != noErr {
+            SenderLog.info("Video encode submit failed: status=\(status)")
+            finishEncode(failed: true)
+        }
         return true
     }
 
-    private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
-        guard status == noErr, let sample, let data = annexB(sample) else { finishEncode(failed: true); return }
-        do { try transport.sendVideo(data); finishEncode(failed: false) }
-        catch { finishEncode(failed: true) }
+    // A bad frame is skipped and the next frame is forced to a keyframe. Only a
+    // run of consecutive failures ends the session, so a single oversized or
+    // dropped frame never tears down the stream, and a persistent fault never
+    // freezes the picture silently.
+    private func frameFailed(_ detail: String) {
+        lock.lock()
+        consecutiveEncodeErrors += 1
+        let count = consecutiveEncodeErrors
+        lock.unlock()
+        SenderLog.info("Video encode/frame error: \(detail) consecutive=\(count)")
+        if count >= 3 {
+            finishEncode(failed: true)
+        } else {
+            requestKeyframe()
+            finishEncode(failed: false, skipped: true)
+        }
     }
 
-    private func finishEncode(failed: Bool) {
+    private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
+        guard status == noErr, let sample else {
+            frameFailed("status=\(status) sample=\(sample == nil ? "nil" : "present")")
+            return
+        }
+        guard let data = annexB(sample) else {
+            let blockLen = CMSampleBufferGetDataBuffer(sample).map { CMBlockBufferGetDataLength($0) } ?? -1
+            frameFailed("annexB returned nil (blockBytes=\(blockLen), keyframe=\(isKeyframe(sample)))")
+            return
+        }
+        do {
+            if !(try transport.sendVideo(data)) {
+                requestKeyframe()
+                finishEncode(failed: false, skipped: true)
+                return
+            }
+        } catch {
+            frameFailed("sendVideo threw (\(error), bytes=\(data.count))")
+            return
+        }
+        lock.lock()
+        consecutiveEncodeErrors = 0
+        lock.unlock()
+        finishEncode(failed: false)
+    }
+
+    private func finishEncode(failed: Bool, skipped: Bool = false) {
         let now = ProcessInfo.processInfo.systemUptime
         var hasPending = false
         var ended = false
@@ -634,7 +683,9 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         lock.lock()
         encoding = false
         ended = stopped
-        if !failed {
+        if skipped {
+            framesDropped += 1
+        } else if !failed {
             framesEncoded += 1
             totalEncodeMs += max(0.0, (now - encodeStart) * 1000.0)
             if logPeriodicStats {
@@ -661,10 +712,6 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     private func annexB(_ sample: CMSampleBuffer) -> Data? {
         guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
-        var total = 0
-        var pointer: UnsafeMutablePointer<Int8>?
-        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &total,
-                                          dataPointerOut: &pointer) == kCMBlockBufferNoErr, let pointer else { return nil }
         var sets: [Data] = []
         if isKeyframe(sample), let format = CMSampleBufferGetFormatDescription(sample) {
             if activeCodec == "hevc" {
@@ -691,7 +738,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 }
             }
         }
-        return AnnexB.fromAVCC(UnsafeRawBufferPointer(start: pointer, count: total), parameterSets: sets)
+        return AnnexB.fromBlockBuffer(block, parameterSets: sets)
     }
 
     private func isKeyframe(_ sample: CMSampleBuffer) -> Bool {
@@ -759,6 +806,14 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if let scalePool { CVPixelBufferPoolFlush(scalePool, .excessBuffers) }
         scalePool = nil
         display = nil
+        if let token = activityToken {
+            ProcessInfo.processInfo.endActivity(token)
+            activityToken = nil
+        }
+        if wakeAssertion != 0 {
+            IOPMAssertionRelease(wakeAssertion)
+            wakeAssertion = 0
+        }
         if sleepAssertion != 0 {
             IOPMAssertionRelease(sleepAssertion)
             sleepAssertion = 0

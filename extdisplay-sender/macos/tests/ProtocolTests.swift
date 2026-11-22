@@ -3,6 +3,7 @@
 // the screen, posts an event or touches TCC: RemoteInput records the CGEvents
 // it would post through an injected sink.
 import CoreGraphics
+import CoreMedia
 import Foundation
 
 final class Recorder {
@@ -181,6 +182,16 @@ enum ProtocolTests {
         expectThrow("rejects a control payload that does not start with an object") {
             _ = try Wire.object(Data("[]".utf8))
         }
+        check(Wire.maxFrame == 8 * 1024 * 1024, "Wire.maxFrame is 8 MiB matching receiver")
+        do {
+            let fiveMiB = Data(repeating: 0xab, count: 5 * 1024 * 1024)
+            let framed = try Wire.frame(fiveMiB)
+            let prefixLen = framed.prefix(4).reduce(0) { ($0 << 8) | Int($1) }
+            check(framed.count == fiveMiB.count + 4 && prefixLen == fiveMiB.count,
+                  "frames a 5 MiB video payload cleanly within the 8 MiB limit")
+        } catch {
+            check(false, "frames a 5 MiB video payload cleanly: \(error)")
+        }
     }
 
     static func annexBTests() {
@@ -192,6 +203,57 @@ enum ProtocolTests {
             + Data([0, 0, 0, 1]) + slice
         let output = avcc.withUnsafeBytes { AnnexB.fromAVCC($0, parameterSets: sets) }
         check(output == expected, "converts AVCC to Annex-B with SPS/PPS on keyframes")
+
+        // Contiguous CMBlockBuffer fast path.
+        var contigBlock: CMBlockBuffer?
+        let contigMem = UnsafeMutableRawPointer.allocate(byteCount: avcc.count, alignment: 1)
+        defer { contigMem.deallocate() }
+        avcc.copyBytes(to: contigMem.assumingMemoryBound(to: UInt8.self), count: avcc.count)
+        let contigStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: contigMem, blockLength: avcc.count,
+            blockAllocator: kCFAllocatorNull, customBlockSource: nil,
+            offsetToData: 0, dataLength: avcc.count, flags: 0, blockBufferOut: &contigBlock)
+        check(contigStatus == kCMBlockBufferNoErr && contigBlock != nil
+              && CMBlockBufferIsRangeContiguous(contigBlock!, atOffset: 0, length: avcc.count)
+              && AnnexB.fromBlockBuffer(contigBlock!, parameterSets: sets) == expected,
+              "converts a contiguous CMBlockBuffer to intact Annex-B")
+
+        // Non-contiguous 2-segment CMBlockBuffer splitting an AVCC NAL unit across two
+        // separate heap allocations so reading past segment 0 would yield corrupt bytes.
+        let bigNal = Data((0..<64).map { UInt8(($0 * 17 + 5) & 0xff) })
+        let fullAvcc = Data([0, 0, 0, UInt8(bigNal.count)]) + bigNal + Data([0, 0, 0, 2]) + slice
+        let fullExpected = Data([0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce])
+            + Data([0, 0, 0, 1]) + bigNal + Data([0, 0, 0, 1]) + slice
+        let splitAt = 19
+        let part1 = fullAvcc.prefix(splitAt)
+        let part2 = fullAvcc.dropFirst(splitAt)
+        let seg1 = UnsafeMutableRawPointer.allocate(byteCount: part1.count + 64, alignment: 1)
+        let seg2 = UnsafeMutableRawPointer.allocate(byteCount: part2.count, alignment: 1)
+        defer { seg1.deallocate(); seg2.deallocate() }
+        memset(seg1, 0xee, part1.count + 64)
+        part1.copyBytes(to: seg1.assumingMemoryBound(to: UInt8.self), count: part1.count)
+        part2.copyBytes(to: seg2.assumingMemoryBound(to: UInt8.self), count: part2.count)
+        var nonContigBlock: CMBlockBuffer?
+        let s0 = CMBlockBufferCreateEmpty(
+            allocator: kCFAllocatorDefault, capacity: 2, flags: 0, blockBufferOut: &nonContigBlock)
+        let s1 = nonContigBlock.map {
+            CMBlockBufferAppendMemoryBlock(
+                $0, memoryBlock: seg1, length: part1.count, blockAllocator: kCFAllocatorNull,
+                customBlockSource: nil, offsetToData: 0, dataLength: part1.count, flags: 0)
+        } ?? kCMBlockBufferBadPointerParameterErr
+        let s2 = nonContigBlock.map {
+            CMBlockBufferAppendMemoryBlock(
+                $0, memoryBlock: seg2, length: part2.count, blockAllocator: kCFAllocatorNull,
+                customBlockSource: nil, offsetToData: 0, dataLength: part2.count, flags: 0)
+        } ?? kCMBlockBufferBadPointerParameterErr
+        let isContig = nonContigBlock.map {
+            CMBlockBufferIsRangeContiguous($0, atOffset: 0, length: fullAvcc.count)
+        } ?? true
+        let nonContigOut = nonContigBlock.flatMap { AnnexB.fromBlockBuffer($0, parameterSets: sets) }
+        check(s0 == kCMBlockBufferNoErr && s1 == kCMBlockBufferNoErr && s2 == kCMBlockBufferNoErr
+              && !isContig && nonContigOut == fullExpected,
+              "converts a non-contiguous 2-segment CMBlockBuffer split mid-NAL to intact Annex-B")
+
         avcc = Data([0, 0, 0, 9, 0x65])
         check(avcc.withUnsafeBytes { AnnexB.fromAVCC($0, parameterSets: []) } == nil,
               "rejects an AVCC length that runs past the sample")

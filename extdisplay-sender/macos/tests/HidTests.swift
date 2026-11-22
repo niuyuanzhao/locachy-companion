@@ -177,6 +177,10 @@ enum HidTests {
             }
             guard conn >= 0 else { return }
             defer { Darwin.close(conn) }
+            // A write to a peer that already closed must fail with EPIPE instead of
+            // raising SIGPIPE and killing the test (production sets this on its socket too).
+            var noSigPipe: Int32 = 1
+            _ = setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
             var reader = KarabinerStreamReader()
             var buf = [UInt8](repeating: 0, count: 4096)

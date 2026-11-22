@@ -44,7 +44,7 @@ private func dispatchBytes(_ data: Data) -> dispatch_data_t {
 
 final class SecureTransport {
     private var connection: NWConnection?
-    private let queue = DispatchQueue(label: "locachy.sender.transport")
+    private let queue = DispatchQueue(label: "locachy.sender.transport", qos: .userInteractive)
     private let sendLock = NSLock()
     private var reader = FrameReader()
     private var timer: DispatchSourceTimer?
@@ -165,9 +165,13 @@ final class SecureTransport {
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 2, repeating: 2)
             timer.setEventHandler { [weak self] in
-                guard let self, !self.ended else { return }
-                guard ProcessInfo.processInfo.systemUptime - self.lastReceived < 8 else { self.finish("Cable session timed out"); return }
-                if self.ready { self.sendObject(["type": "ping"]) }
+                guard let self, !self.ended, self.ready else { return }
+                let age = ProcessInfo.processInfo.systemUptime - self.lastReceived
+                guard age < 8 else {
+                    self.finish(String(format: "Cable session timed out (no peer data for %.1fs)", age))
+                    return
+                }
+                self.sendObject(["type": "ping"])
             }
             self.timer = timer
             timer.resume()
@@ -192,51 +196,70 @@ final class SecureTransport {
                     self.lastReceived = ProcessInfo.processInfo.systemUptime
                     try self.reader.feed(data) { payload in self.onControl?(try Wire.object(payload)) }
                 }
-                if complete || error != nil {
+                if let error {
+                    self.finish("Cable disconnected (\(error))")
+                } else if complete {
                     try self.reader.finish()
-                    self.finish("Cable disconnected")
-                } else { self.receive() }
+                    self.finish("Cable disconnected (peer closed)")
+                } else {
+                    self.receive()
+                }
             } catch { self.finish("Invalid control stream") }
         }
     }
     func sendObject(_ object: [String: Any]) {
-        do { try send(try Wire.json(object), video: false) }
+        do { _ = try send(try Wire.json(object), video: false) }
         catch { stop("Control message could not be sent") }
     }
-    func sendVideo(_ data: Data) throws { try send(data, video: true) }
-    private func send(_ payload: Data, video: Bool) throws {
+    @discardableResult
+    func sendVideo(_ data: Data) throws -> Bool { try send(data, video: true) }
+    private func send(_ payload: Data, video: Bool) throws -> Bool {
         let framed = try Wire.frame(payload)
+        sendLock.lock()
+        if video && queuedVideo >= 32 {
+            sendLock.unlock()
+            return false
+        }
+        if !video && queuedControl >= 64 {
+            sendLock.unlock()
+            stop("Peer is not consuming the stream")
+            return false
+        }
+        if video { queuedVideo += 1 } else { queuedControl += 1 }
+        sendLock.unlock()
         queue.async { [weak self] in
-            guard let self, self.ready, !self.ended, let connection = self.connection else { return }
-            self.sendLock.lock()
-            let currentVideo = self.queuedVideo
-            let currentControl = self.queuedControl
-            let allowed = video ? currentVideo < 32 : currentControl < 64
-            if allowed {
-                if video { self.queuedVideo += 1 } else { self.queuedControl += 1 }
+            guard let self else { return }
+            guard self.ready, !self.ended, let connection = self.connection else {
+                self.sendLock.lock()
+                if video {
+                    self.queuedVideo = max(0, self.queuedVideo - 1)
+                } else {
+                    self.queuedControl = max(0, self.queuedControl - 1)
+                }
+                self.sendLock.unlock()
+                return
             }
-            self.sendLock.unlock()
-            guard allowed else { self.finish("Peer is not consuming the stream"); return }
             connection.send(content: framed, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 var drainHandler: (() -> Void)?
                 self.sendLock.lock()
                 if video {
-                    self.queuedVideo -= 1
+                    self.queuedVideo = max(0, self.queuedVideo - 1)
                     if self.queuedVideo < 2 {
                         drainHandler = self._onVideoDrained
                     }
                 } else {
-                    self.queuedControl -= 1
+                    self.queuedControl = max(0, self.queuedControl - 1)
                 }
                 self.sendLock.unlock()
-                if error != nil {
-                    self.finish("Cable send failed")
+                if let error {
+                    self.finish("Cable send failed (\(error))")
                 } else {
                     drainHandler?()
                 }
             })
         }
+        return true
     }
     func stop(_ reason: String) { queue.async { self.finish(reason) } }
     private func finish(_ reason: String) {

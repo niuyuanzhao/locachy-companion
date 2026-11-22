@@ -56,11 +56,29 @@ final class Sender {
         transport = try SecureTransport(endpoint: endpoint, key: key)
         transport.onControl = { [weak self] object in
             guard let self else { return }
-            if let type = object["type"] as? String, Self.inputTypes.contains(type) {
-                self.inputQueue.async { [weak self] in self?.handleRemoteInput(object, type: type) }
-            } else {
-                DispatchQueue.main.async { [weak self] in self?.control(object) }
+            if let type = object["type"] as? String {
+                if type == "ping" {
+                    // Reply on the transport queue directly so main-thread work never stalls keepalive.
+                    var pong: [String: Any] = ["type": "pong", "mt": Int(Date().timeIntervalSince1970 * 1000)]
+                    if object["t"] != nil, let ts = try? Wire.integer(object, "t", 0...Int.max) {
+                        pong["t"] = ts
+                    }
+                    self.transport.sendObject(pong)
+                    return
+                }
+                if type == "kf" {
+                    self.captureLock.lock()
+                    let session = self.inputCapture
+                    self.captureLock.unlock()
+                    session?.requestKeyframe()
+                    return
+                }
+                if Self.inputTypes.contains(type) {
+                    self.inputQueue.async { [weak self] in self?.handleRemoteInput(object, type: type) }
+                    return
+                }
             }
+            DispatchQueue.main.async { [weak self] in self?.control(object) }
         }
         transport.onEnd = { [weak self] reason in DispatchQueue.main.async { self?.finish(reason, code: 1) } }
     }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
 import CoreFoundation
+import CoreMedia
 
 struct SenderError: Error, CustomStringConvertible {
     let description: String
@@ -11,7 +12,7 @@ struct SenderError: Error, CustomStringConvertible {
 // Discovery is separate and unauthenticated. No mirror fallback, clipboard,
 // file transfer, or power commands exist in the authenticated stream.
 enum Wire {
-    static let maxFrame = 4 * 1024 * 1024
+    static let maxFrame = 8 * 1024 * 1024
     static let maxControl = 32767
     static let identity = "locachy-extdisplay-v1"
     // TLS_PSK_WITH_AES_128_GCM_SHA256: the only PSK suite Network.framework negotiates.
@@ -219,5 +220,25 @@ enum AnnexB {
             offset += size
         }
         return output.starts(with: start) && output.count <= Wire.maxFrame ? output : nil
+    }
+
+    static func fromBlockBuffer(_ block: CMBlockBuffer, parameterSets: [Data]) -> Data? {
+        var lengthAtOffset = 0
+        var total = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(
+            block, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &total, dataPointerOut: &pointer
+        ) == kCMBlockBufferNoErr, total > 0, let pointer else { return nil }
+        if lengthAtOffset == total {
+            return fromAVCC(UnsafeRawBufferPointer(start: pointer, count: total), parameterSets: parameterSets)
+        }
+        var contiguous = Data(count: total)
+        let status: OSStatus = contiguous.withUnsafeMutableBytes { dest in
+            guard let base = dest.baseAddress else { return kCMBlockBufferBadPointerParameterErr }
+            return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: total, destination: base)
+        }
+        guard status == kCMBlockBufferNoErr else { return nil }
+        return contiguous.withUnsafeBytes { fromAVCC($0, parameterSets: parameterSets) }
     }
 }
