@@ -49,6 +49,7 @@ enum ProtocolTests {
         pairingTests()
         scrollSemanticTests()
         modifierTransitionTests()
+        physicalAndVirtualHidTests()
         tabletAndTouchTests()
         if failures == 0 {
             print("PASS: all protocol tests")
@@ -222,6 +223,128 @@ enum ProtocolTests {
                   "a Shift press shows Shift and its release clears it (state after the event)")
         } catch {
             check(false, "Shift transitions, state after: \(error)")
+        }
+    }
+
+final class FakeVirtualKeyboard: VirtualKeyboardBackend {
+    var status: HidHelperStatus
+    var isReady: Bool { status.state == .ready }
+    var keyboardReports: [(UInt8, [UInt16])] = []
+    var consumerReports: [[UInt16]] = []
+    var resets = 0
+    var failSends = false
+
+    init(ready: Bool = true) {
+        status = HidHelperStatus(state: ready ? .ready : .unavailable, detail: 0)
+    }
+
+    func sendKeyboardReport(modifiers: UInt8, keys: [UInt16]) -> Bool {
+        if failSends { return false }
+        keyboardReports.append((modifiers, keys))
+        return true
+    }
+
+    func sendConsumerReport(usages: [UInt16]) -> Bool {
+        if failSends { return false }
+        consumerReports.append(usages)
+        return true
+    }
+
+    func reset() {
+        resets += 1
+    }
+
+    func stop() {}
+}
+
+    static func physicalAndVirtualHidTests() {
+        // 1. Physical 1:1 CGEvent fallback (no virtual keyboard): evdev maps directly
+        // to macOS CGKeyCode, arrow/function keys include implicit SecondaryFn/NumericPad flags.
+        do {
+            let recorder = Recorder()
+            let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                    sink: { recorder.posted.append($0) })
+            try input.handle(["type": "key", "device": 1, "code": 125, "keysym": 0xffeb,
+                              "modifiers": 0, "locks": 0, "state": 1, "mapping": "logical"])
+            try input.handle(["type": "key", "device": 1, "code": 103, "keysym": 0xff52,
+                              "modifiers": 8, "locks": 0, "state": 1, "mapping": "logical"])
+            try input.handle(["type": "key", "device": 1, "code": 103, "keysym": 0xff52,
+                              "modifiers": 8, "locks": 0, "state": 0, "mapping": "logical"])
+            try input.handle(["type": "key", "device": 1, "code": 125, "keysym": 0xffeb,
+                              "modifiers": 8, "locks": 0, "state": 0, "mapping": "logical"])
+            check(recorder.posted.count == 4
+                  && recorder.posted[0].type == .flagsChanged
+                  && recorder.posted[0].getIntegerValueField(.keyboardEventKeycode) == 55
+                  && recorder.posted[0].flags.contains(.maskCommand)
+                  && recorder.posted[1].type == .keyDown
+                  && recorder.posted[1].getIntegerValueField(.keyboardEventKeycode) == 126
+                  && recorder.posted[1].flags.contains(.maskSecondaryFn)
+                  && recorder.posted[1].flags.contains(.maskNumericPad)
+                  && recorder.posted[3].type == .flagsChanged
+                  && !recorder.posted[3].flags.contains(.maskCommand),
+                  "physical 1:1 CGEvent fallback maps evdev Meta+Up with implicit SecondaryFn/NumericPad flags")
+        } catch {
+            check(false, "physical CGEvent fallback: \(error)")
+        }
+
+        // 2. Ready virtual HID backend receives raw USB HID reports for Meta hold + keys,
+        // ignores Linux repeat events (macOS repeats natively), updates pointer modifier flags,
+        // and resets on cancel.
+        do {
+            let recorder = Recorder()
+            let fakeHid = FakeVirtualKeyboard(ready: true)
+            let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                    sink: { recorder.posted.append($0) },
+                                    virtualKeyboard: fakeHid)
+            // Press Left Meta (evdev 125 -> HID modifier 0x08)
+            try input.handle(["type": "key", "device": 1, "code": 125, "keysym": 0xffeb,
+                              "modifiers": 0, "locks": 0, "state": 1, "mapping": "logical"])
+            // Press C (evdev 46 -> HID usage 0x06), repeat, then release C
+            try input.handle(["type": "key", "device": 1, "code": 46, "keysym": 0x63,
+                              "modifiers": 8, "locks": 0, "state": 1, "mapping": "logical"])
+            try input.handle(["type": "key", "device": 1, "code": 46, "keysym": 0x63,
+                              "modifiers": 8, "locks": 0, "state": 2, "mapping": "logical"])
+            // Pointer click while Meta held in virtual HID must carry Command flag on CGEvent
+            try input.handle(["type": "button", "button": 272, "state": 1, "x": 0.5, "y": 0.5])
+            try input.handle(["type": "button", "button": 272, "state": 0, "x": 0.5, "y": 0.5])
+            try input.handle(["type": "key", "device": 1, "code": 46, "keysym": 0x63,
+                              "modifiers": 8, "locks": 0, "state": 0, "mapping": "logical"])
+            // Cancel while Meta still held must reset virtual HID
+            try input.handle(["type": "cancel", "scope": "all"])
+            check(fakeHid.keyboardReports.count == 3
+                  && fakeHid.keyboardReports[0].0 == 0x08 && fakeHid.keyboardReports[0].1 == []
+                  && fakeHid.keyboardReports[1].0 == 0x08 && fakeHid.keyboardReports[1].1 == [0x06]
+                  && fakeHid.keyboardReports[2].0 == 0x08 && fakeHid.keyboardReports[2].1 == []
+                  && fakeHid.resets == 1
+                  && recorder.posted.count == 2
+                  && recorder.posted[0].type == .leftMouseDown
+                  && recorder.posted[0].flags.contains(.maskCommand)
+                  && input.heldCount == 0,
+                  "virtual HID backend receives raw modifier+key reports, suppresses repeat, syncs mouse flags, and resets on cancel")
+        } catch {
+            check(false, "virtual HID backend: \(error)")
+        }
+
+        // 3. When virtual HID send fails mid-session, RemoteInput cleanly falls back to CGEvent.
+        do {
+            let recorder = Recorder()
+            let fakeHid = FakeVirtualKeyboard(ready: true)
+            fakeHid.failSends = true
+            let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                    sink: { recorder.posted.append($0) },
+                                    virtualKeyboard: fakeHid)
+            try input.handle(["type": "key", "device": 1, "code": 30, "keysym": 0x61,
+                              "modifiers": 0, "locks": 0, "state": 1, "mapping": "logical"])
+            try input.handle(["type": "key", "device": 1, "code": 30, "keysym": 0x61,
+                              "modifiers": 0, "locks": 0, "state": 0, "mapping": "logical"])
+            check(recorder.posted.count == 2
+                  && recorder.posted[0].type == .keyDown
+                  && recorder.posted[0].getIntegerValueField(.keyboardEventKeycode) == 0
+                  && recorder.posted[1].type == .keyUp
+                  && fakeHid.resets >= 1,
+                  "virtual HID write failure falls back transparently to physical CGEvent")
+        } catch {
+            check(false, "virtual HID fallback on failure: \(error)")
         }
     }
 
@@ -453,8 +576,8 @@ enum ProtocolTests {
             try input.handle(["type": "key", "device": 1, "code": 30, "keysym": 0x61,
                               "modifiers": 0, "locks": 0, "state": 1])
         }
-        expectThrow("a non-Unicode, non-special keysym is refused") {
-            try input.handle(["type": "key", "device": 1, "code": 30, "keysym": 0x1000,
+        expectThrow("a non-Unicode, non-special keysym without a physical code is refused") {
+            try input.handle(["type": "key", "device": 1, "code": 0, "keysym": 0x1000,
                               "modifiers": 0, "locks": 0, "state": 1, "mapping": "logical"])
         }
         recorder.events.removeAll()

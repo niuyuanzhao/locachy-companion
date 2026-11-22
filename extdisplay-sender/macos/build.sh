@@ -10,6 +10,7 @@ sign_outputs() {
     SIGN_APP=$2
     SIGN_DIR=$3
     SIGN_TMP=$4
+    SIGN_HELPER=${5:-}
     mkdir -p -- "$SIGN_DIR" 2>/dev/null || SIGN_DIR="$SIGN_TMP/signing"
     mkdir -p -- "$SIGN_DIR"
     KEYCHAIN="$SIGN_DIR/signing.keychain-db"
@@ -47,15 +48,19 @@ EOF
     cp -- "$SIGN_PRODUCT" "$SIGN_APP/Contents/MacOS/locachy-macos-sender"
     codesign --force --deep --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || \
         codesign --force --deep --sign - --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || true
+    if [ -n "$SIGN_HELPER" ] && [ -f "$SIGN_HELPER" ]; then
+        codesign --force --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.hid-helper "$SIGN_HELPER" >/dev/null 2>&1 || \
+            codesign --force --sign - --identifier org.locachy.extdisplay.hid-helper "$SIGN_HELPER" >/dev/null 2>&1 || true
+    fi
 }
 
 if [ "${1:-}" = "--sign" ]; then
-    [ $# -eq 4 ] || { printf '%s\n' 'usage: build.sh --sign PRODUCT APP SIGN_DIR' >&2; exit 2; }
+    [ $# -eq 4 ] || [ $# -eq 5 ] || { printf '%s\n' 'usage: build.sh --sign PRODUCT APP SIGN_DIR [HELPER]' >&2; exit 2; }
     TMP_SIGN=$(mktemp -d "${TMPDIR:-/tmp}/locachy-sign.XXXXXX")
     trap 'rm -rf -- "$TMP_SIGN"' EXIT
     rm -rf -- "$4/LOCachy Extended Display.app"
     cp -R -- "$3" "$4/LOCachy Extended Display.app"
-    sign_outputs "$2" "$4/LOCachy Extended Display.app" "$4" "$TMP_SIGN"
+    sign_outputs "$2" "$4/LOCachy Extended Display.app" "$4" "$TMP_SIGN" "${5:-}"
     cp -- "$4/LOCachy Extended Display.app/Contents/MacOS/locachy-macos-sender" "$3/Contents/MacOS/locachy-macos-sender" 2>/dev/null || true
     exit 0
 fi
@@ -68,6 +73,7 @@ ARCHIVE="$OUT/opendisplay-$UPSTREAM_COMMIT.tar.gz"
 SOURCE="$OUT/opendisplay-$UPSTREAM_COMMIT"
 GENERATED="$OUT/generated"
 PRODUCT="$OUT/locachy-macos-sender"
+HELPER="$OUT/locachy-hid-helper"
 APP="$OUT/LOCachy Extended Display.app"
 
 case "$(uname -s)" in Darwin) ;; *) printf '%s\n' 'The macOS sender must be built on macOS with xcrun.' >&2; exit 2 ;; esac
@@ -109,6 +115,9 @@ TARGET="$(uname -m)-apple-macos13.0"
     "$ROOT/sources/DisplayModeDB.swift" \
     "$ROOT/sources/PairingCode.swift" \
     "$ROOT/sources/SecureTransport.swift" \
+    "$ROOT/sources/HidHelperProtocol.swift" \
+    "$ROOT/sources/KeyMap.swift" \
+    "$ROOT/sources/VirtualKeyboardClient.swift" \
     "$ROOT/sources/Input.swift" \
     "$ROOT/sources/Capture.swift" \
     "$ROOT/sources/LinkInterfaces.swift" \
@@ -116,6 +125,13 @@ TARGET="$(uname -m)-apple-macos13.0"
     "$ROOT/sources/ConnectionWindow.swift" \
     "$ROOT/sources/SenderMain.swift" \
     -o "$PRODUCT"
+
+"$SWIFTC" -swift-version 5 -parse-as-library -target "$TARGET" -sdk "$SDK" -O \
+    -framework Foundation -framework Security -framework SystemConfiguration \
+    "$ROOT/sources/HidHelperProtocol.swift" \
+    "$ROOT/sources/KarabinerWire.swift" \
+    "$ROOT/sources/HidHelperMain.swift" \
+    -o "$HELPER"
 
 # The app bundle is the normal no-argument entry point. The raw binary remains
 # available for the documented manual CLI and for protocol tests.
@@ -131,8 +147,8 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>org.locachy.extdisplay.sender</string>
 <key>CFBundleName</key><string>LOCachy Extended Display</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.4.6</string>
-<key>CFBundleVersion</key><string>0.4.6</string>
+<key>CFBundleShortVersionString</key><string>0.5.0</string>
+<key>CFBundleVersion</key><string>0.5.0</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Discover and connect to the LOCachy extended display over a dedicated Thunderbolt or USB4 link.</string>
@@ -143,8 +159,9 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 SIGN_DIR="${LOCACHY_SIGN_DIR:-${HOME:-$OUT}/Library/Application Support/LOCachy}"
-sign_outputs "$PRODUCT" "$APP" "$SIGN_DIR" "$OUT"
+sign_outputs "$PRODUCT" "$APP" "$SIGN_DIR" "$OUT" "$HELPER"
 
 printf 'PASS: built %s\n' "$PRODUCT"
+printf 'PASS: built %s\n' "$HELPER"
 printf 'PASS: built app bundle %s\n' "$APP"
 

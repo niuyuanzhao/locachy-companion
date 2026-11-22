@@ -139,11 +139,17 @@ final class RemoteInput {
     private let displays: () -> [CGRect]
     private let live: Bool
     private let sink: Sink
+    private let keyboardSink: Sink
     private let now: () -> TimeInterval
-    // A real HID-state source, as upstream InputInjector uses: menu tracking
-    // treats sourceless synthetic clicks as malformed.
+    // A real HID-state source for pointer/mouse/scroll/touch/tablet: menu
+    // tracking treats sourceless synthetic clicks as malformed.
     private let source = CGEventSource(stateID: .hidSystemState)
+    // A private-state source for fallback keyboard CGEvents posted to the
+    // session tap, matching libvirtualhid and avoiding local keyboard state leaks.
+    private let keyboardSource = CGEventSource(stateID: .privateState)
+    private var virtualKeyboard: VirtualKeyboardBackend?
     private var held: [KeyIdentity: MappedKey] = [:]
+    private var heldHid: [KeyIdentity: HidKey] = [:]
     private var buttons = Set<Int>()
     private var lastPoint = CGPoint.zero
     private var lastNorm = CGPoint(x: 0.5, y: 0.5)
@@ -203,24 +209,37 @@ final class RemoteInput {
             guard AXIsProcessTrusted() else { return }
             event.post(tap: .cghidEventTap)
         }
+        keyboardSink = { event in
+            guard AXIsProcessTrusted() else { return }
+            event.post(tap: .cgSessionEventTap)
+        }
+        let client = VirtualKeyboardClient()
+        client.start()
+        virtualKeyboard = client
     }
     // Unit tests create CGEvents but never post, query a display or request TCC.
     init(bounds: @escaping () -> CGRect,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         sink: @escaping Sink) {
+         sink: @escaping Sink,
+         virtualKeyboard: VirtualKeyboardBackend? = nil) {
         self.bounds = bounds
         self.displays = { [bounds()] }
         self.live = false
         self.now = now
         self.sink = sink
+        self.keyboardSink = sink
+        self.virtualKeyboard = virtualKeyboard
     }
 
     deinit {
         disarmLongPress()
+        heldHid.removeAll()
+        virtualKeyboard?.reset()
+        virtualKeyboard?.stop()
     }
 
     var heldCount: Int {
-        held.count + buttons.count + (tabletTipDown ? 1 : 0) + tabletBarrelButtons.count + (touchLegacyDown ? 1 : 0)
+        held.count + heldHid.count + buttons.count + (tabletTipDown ? 1 : 0) + tabletBarrelButtons.count + (touchLegacyDown ? 1 : 0)
     }
 
     func invalidateDisplayCache() {
@@ -280,6 +299,58 @@ final class RemoteInput {
         return best
     }
 
+    private func hidModifierBitmap() -> UInt8 {
+        var mask: UInt8 = 0
+        for hid in heldHid.values {
+            if case .modifier(let bit) = hid {
+                mask |= bit
+            }
+        }
+        return mask
+    }
+
+    private func hidKeyboardUsages() -> [UInt16] {
+        var usages = Set<UInt16>()
+        for hid in heldHid.values {
+            if case .keyboard(let usage) = hid {
+                usages.insert(usage)
+            }
+        }
+        let sorted = usages.sorted()
+        let limit = min(32, HidHelperIPC.maxKeys)
+        return sorted.count > limit ? Array(sorted.prefix(limit)) : sorted
+    }
+
+    private func hidConsumerUsages() -> [UInt16] {
+        var usages = Set<UInt16>()
+        for hid in heldHid.values {
+            if case .consumer(let usage) = hid {
+                usages.insert(usage)
+            }
+        }
+        let sorted = usages.sorted()
+        let limit = min(32, HidHelperIPC.maxKeys)
+        return sorted.count > limit ? Array(sorted.prefix(limit)) : sorted
+    }
+
+    private func hidSemanticFlags(from modifiers: UInt8) -> CGEventFlags {
+        var result: CGEventFlags = []
+        if modifiers & (0x02 | 0x20) != 0 { result.insert(.maskShift) }
+        if modifiers & (0x01 | 0x10) != 0 { result.insert(.maskControl) }
+        if modifiers & (0x04 | 0x40) != 0 { result.insert(.maskAlternate) }
+        if modifiers & (0x08 | 0x80) != 0 { result.insert(.maskCommand) }
+        return result
+    }
+
+    private func sendHidState(for changed: HidKey, via vk: VirtualKeyboardBackend) -> Bool {
+        switch changed {
+        case .modifier, .keyboard:
+            return vk.sendKeyboardReport(modifiers: hidModifierBitmap(), keys: hidKeyboardUsages())
+        case .consumer:
+            return vk.sendConsumerReport(usages: hidConsumerUsages())
+        }
+    }
+
     private func deviceModifierFlags() -> CGEventFlags {
         var raw: UInt64 = 0
         for mapped in held.values {
@@ -293,6 +364,18 @@ final class RemoteInput {
             case 58: raw |= 0x20       // NX_DEVICELALTKEYMASK
             case 61: raw |= 0x40       // NX_DEVICERALTKEYMASK
             default: break
+            }
+        }
+        for hid in heldHid.values {
+            if case .modifier(let bit) = hid {
+                if bit & 0x01 != 0 { raw |= 0x01 }   // NX_DEVICELCTLKEYMASK
+                if bit & 0x02 != 0 { raw |= 0x02 }   // NX_DEVICELSHIFTKEYMASK
+                if bit & 0x04 != 0 { raw |= 0x20 }   // NX_DEVICELALTKEYMASK
+                if bit & 0x08 != 0 { raw |= 0x08 }   // NX_DEVICELCMDKEYMASK
+                if bit & 0x10 != 0 { raw |= 0x2000 } // NX_DEVICERCTLKEYMASK
+                if bit & 0x20 != 0 { raw |= 0x04 }   // NX_DEVICERSHIFTKEYMASK
+                if bit & 0x40 != 0 { raw |= 0x40 }   // NX_DEVICERALTKEYMASK
+                if bit & 0x80 != 0 { raw |= 0x10 }   // NX_DEVICERCMDKEYMASK
             }
         }
         return CGEventFlags(rawValue: raw)
@@ -310,23 +393,25 @@ final class RemoteInput {
 
     private func releaseFlags(for mapped: MappedKey, from before: CGEventFlags) -> CGEventFlags {
         guard !mapped.modifier.isEmpty else { return before }
-        if held.values.contains(where: { $0.modifier.contains(mapped.modifier) }) {
+        if held.values.contains(where: { $0.modifier.contains(mapped.modifier) })
+            || !hidSemanticFlags(from: hidModifierBitmap()).intersection(mapped.modifier).isEmpty {
             return before.union(mapped.modifier)
         }
         return before.subtracting(mapped.modifier)
     }
 
     private func postKey(_ mapped: MappedKey, down: Bool, flags: CGEventFlags, repeatKey: Bool = false) {
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: mapped.code, keyDown: down) else { return }
+        guard let event = CGEvent(keyboardEventSource: keyboardSource, virtualKey: mapped.code, keyDown: down) else { return }
         let flagsChanged = KeyMapping.isModifier(mapped.code)
         if flagsChanged { event.type = .flagsChanged }
-        event.flags = eventFlags(flags, flagsChanged: flagsChanged)
+        let implicit = KeyMap.implicitKeyFlags(forMacKeyCode: mapped.code)
+        event.flags = eventFlags(flags.union(implicit), flagsChanged: flagsChanged)
         event.setIntegerValueField(.keyboardEventAutorepeat, value: repeatKey ? 1 : 0)
         if let text = mapped.text {
             let utf16 = Array(text.utf16)
             utf16.withUnsafeBufferPointer { event.keyboardSetUnicodeString(stringLength: $0.count, unicodeString: $0.baseAddress) }
         }
-        sink(event)
+        keyboardSink(event)
     }
 
     private func nextClickCount(for button: Int, at point: CGPoint, maxRadius: Double = 4) -> Int64 {
@@ -1037,11 +1122,30 @@ final class RemoteInput {
             let identity = KeyIdentity(device: try Wire.integer(object, "device", 1...Int(UInt32.max)), code: try Wire.integer(object, "code", 0...767))
             let state = try Wire.integer(object, "state", 0...2)
             let modifiers = try Wire.integer(object, "modifiers", 0...127), locks = try Wire.integer(object, "locks", 0...3)
-            guard object["mapping"] as? String == "logical" else { throw SenderError("Unsupported keyboard mapping") }
+            let mapping = object["mapping"] as? String
+            guard mapping == "logical" || mapping == "physical" else { throw SenderError("Unsupported keyboard mapping") }
             // The wire reports the state before the event. Apply the key's
             // own transition on top of it for flagsChanged events.
             let before = KeyMapping.flags(modifiers, locks)
             if state == 0 {
+                if let releasedHid = heldHid.removeValue(forKey: identity) {
+                    if let vk = virtualKeyboard {
+                        if !sendHidState(for: releasedHid, via: vk) {
+                            heldHid.removeAll()
+                            vk.reset()
+                        }
+                    } else {
+                        heldHid.removeAll()
+                    }
+                    let removedModFlags: CGEventFlags = {
+                        if case .modifier(let bit) = releasedHid { return hidSemanticFlags(from: bit) }
+                        return []
+                    }()
+                    let activeMods = hidSemanticFlags(from: hidModifierBitmap())
+                        .union(held.values.reduce(CGEventFlags()) { $0.union($1.modifier) })
+                    flags = before.subtracting(removedModFlags).union(activeMods)
+                    return
+                }
                 guard let mapped = held.removeValue(forKey: identity) else { return }
                 flags = releaseFlags(for: mapped, from: before)
                 // Multiple physical keyboards may hold the same logical key.
@@ -1049,18 +1153,60 @@ final class RemoteInput {
                     postKey(mapped, down: false, flags: flags)
                 }
             } else if state == 2 {
+                if heldHid[identity] != nil {
+                    // macOS natively handles key repeat for held virtual USB HID keys.
+                    return
+                }
                 guard let mapped = held[identity], !KeyMapping.isModifier(mapped.code) else { return }
                 flags = before
                 postKey(mapped, down: true, flags: before.union(mapped.layoutFlags), repeatKey: true)
             } else {
+                if let prevHid = heldHid.removeValue(forKey: identity) {
+                    if let vk = virtualKeyboard, !sendHidState(for: prevHid, via: vk) {
+                        heldHid.removeAll()
+                        vk.reset()
+                    }
+                }
                 if let prev = held.removeValue(forKey: identity) {
                     postKey(prev, down: false, flags: releaseFlags(for: prev, from: before))
                 }
-                guard held.count < 128 else { throw SenderError("Too many held keys") }
-                let sym = UInt32(try Wire.integer(object, "keysym", 0...Int(UInt32.max)))
-                if sym == 0 { return }
-                var mapped = try KeyMapping.logical(sym, flags: before)
-                mapped.modifier = KeyMapping.modifierBit(sym)
+                guard held.count + heldHid.count < 128 else { throw SenderError("Too many held keys") }
+                let sym: UInt32
+                if mapping == "physical" && object["keysym"] == nil {
+                    sym = 0
+                } else {
+                    sym = UInt32(try Wire.integer(object, "keysym", 0...Int(UInt32.max)))
+                }
+                if let vk = virtualKeyboard, vk.isReady, let hid = KeyMap.hidKey(forEvdev: identity.code) {
+                    heldHid[identity] = hid
+                    if sendHidState(for: hid, via: vk) {
+                        let activeMods = hidSemanticFlags(from: hidModifierBitmap())
+                            .union(held.values.reduce(CGEventFlags()) { $0.union($1.modifier) })
+                        if case .keyboard(0x39) = hid {
+                            flags = before.symmetricDifference(.maskAlphaShift).union(activeMods)
+                        } else {
+                            flags = before.union(activeMods)
+                        }
+                        return
+                    }
+                    heldHid.removeAll()
+                    vk.reset()
+                }
+                var mapped: MappedKey
+                if identity.code > 0, (sym != 0 || mapping == "physical"),
+                   let macCode = KeyMap.macKeyCode(forEvdev: identity.code) {
+                    mapped = MappedKey(
+                        code: macCode,
+                        text: nil,
+                        flags: before,
+                        layoutFlags: [],
+                        modifier: KeyMap.modifierFlag(forMacKeyCode: macCode)
+                    )
+                } else {
+                    if sym == 0 { return }
+                    mapped = try KeyMapping.logical(sym, flags: before)
+                    mapped.modifier = KeyMapping.modifierBit(sym)
+                }
                 held[identity] = mapped
                 flags = before.union(mapped.modifier)
                 if mapped.code == 57 { // Caps Lock toggles only on its press.
@@ -1230,6 +1376,8 @@ final class RemoteInput {
         tabletDistance = 0.0
         tabletRotation = 0.0
         flags = []
+        heldHid.removeAll()
+        virtualKeyboard?.reset()
         let cancelledKeys = held
         held.removeAll()
         var released = Set<CGKeyCode>()

@@ -11,9 +11,19 @@ mkdir -p "$OUT/tests"
 rm -f "$OUT/tests/protocol-tests"
 xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework AppKit -framework Carbon \
-    "$HERE/sources/Wire.swift" "$HERE/sources/PairingCode.swift" "$HERE/sources/Input.swift" \
+    "$HERE/sources/Wire.swift" "$HERE/sources/PairingCode.swift" \
+    "$HERE/sources/HidHelperProtocol.swift" "$HERE/sources/KeyMap.swift" \
+    "$HERE/sources/VirtualKeyboardClient.swift" "$HERE/sources/Input.swift" \
     "$HERE/tests/ProtocolTests.swift" -o "$OUT/tests/protocol-tests"
 "$OUT/tests/protocol-tests"
+
+rm -f "$OUT/tests/hid-tests"
+xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+    -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework Foundation \
+    "$HERE/sources/HidHelperProtocol.swift" "$HERE/sources/KarabinerWire.swift" \
+    "$HERE/sources/VirtualKeyboardClient.swift" "$HERE/tests/HidTests.swift" \
+    -o "$OUT/tests/hid-tests"
+"$OUT/tests/hid-tests"
 
 xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework IOKit -framework Network \
@@ -34,4 +44,5 @@ xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos
 "$HERE/tests/tls-loopback.sh" "$OUT"
 
 "$OUT/locachy-macos-sender" --check
+"$OUT/locachy-hid-helper" --check
 printf '%s\n' 'PASS: all sender checks'
