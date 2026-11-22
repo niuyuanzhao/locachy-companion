@@ -68,25 +68,56 @@ enum KeyMapping {
         guard let scalar = UnicodeScalar(value), !CharacterSet.controlCharacters.contains(scalar) else { return nil }
         return String(scalar)
     }
-    static func logical(_ keysym: UInt32, flags: CGEventFlags) throws -> MappedKey {
-        if let code = special(keysym) { return MappedKey(code: code, text: nil, flags: flags) }
-        guard let text = unicode(keysym) else { throw SenderError("Unsupported logical keysym") }
-        // A target IME may not expose a Unicode layout. In that case fall back
-        // to the layout used beneath the input method, not to a guessed US map.
+    // Snapshot TIS keyboard layout data on the main thread so logical-fallback
+    // lookups on the high-priority input queue never call Carbon TIS APIs off-main.
+    static func snapshotKeyboardLayouts() -> (layouts: [Data], keyboardType: UInt32) {
         let sources = [
             TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
             TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
         ].compactMap { $0 }
+        var layouts: [Data] = []
         for source in sources {
             if let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) {
-                let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
-                let layout = UnsafeRawPointer(CFDataGetBytePtr(data)).assumingMemoryBound(to: UCKeyboardLayout.self)
+                let cfData = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
+                let length = CFDataGetLength(cfData)
+                if length > 0, let ptr = CFDataGetBytePtr(cfData) {
+                    layouts.append(Data(bytes: ptr, count: length))
+                }
+            }
+        }
+        return (layouts, UInt32(LMGetKbdType()))
+    }
+
+    static func logical(_ keysym: UInt32, flags: CGEventFlags,
+                        cachedLayouts: [Data]? = nil,
+                        keyboardType: UInt32? = nil) throws -> MappedKey {
+        if let code = special(keysym) { return MappedKey(code: code, text: nil, flags: flags) }
+        guard let text = unicode(keysym) else { throw SenderError("Unsupported logical keysym") }
+        // A target IME may not expose a Unicode layout. In that case fall back
+        // to the layout used beneath the input method, not to a guessed US map.
+        let layouts: [Data]
+        let kbdType: UInt32
+        if let cachedLayouts, let keyboardType {
+            layouts = cachedLayouts
+            kbdType = keyboardType
+        } else if Thread.isMainThread {
+            let snap = snapshotKeyboardLayouts()
+            layouts = snap.layouts
+            kbdType = snap.keyboardType
+        } else {
+            layouts = []
+            kbdType = 0
+        }
+        for data in layouts {
+            if let matched = data.withUnsafeBytes({ raw -> MappedKey? in
+                guard let base = raw.baseAddress else { return nil }
+                let layout = base.assumingMemoryBound(to: UCKeyboardLayout.self)
                 for combination: UInt32 in [0, UInt32(shiftKey >> 8), UInt32(optionKey >> 8), UInt32((shiftKey | optionKey) >> 8)] {
                     for code: UInt16 in 0...127 {
                         var state: UInt32 = 0, length = 0
                         var chars = [UniChar](repeating: 0, count: 8)
                         let result = UCKeyTranslate(layout, code, UInt16(kUCKeyActionDown), combination,
-                            UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit), &state, chars.count, &length, &chars)
+                            kbdType, OptionBits(kUCKeyTranslateNoDeadKeysBit), &state, chars.count, &length, &chars)
                         if result == noErr, length > 0, String(utf16CodeUnits: chars, count: length) == text {
                             var layoutFlags: CGEventFlags = []
                             if combination & UInt32(shiftKey >> 8) != 0 { layoutFlags.insert(.maskShift) }
@@ -96,6 +127,9 @@ enum KeyMapping {
                         }
                     }
                 }
+                return nil
+            }) {
+                return matched
             }
         }
         // Unicode fallback is text, not a fabricated physical key. Refuse it
@@ -141,6 +175,7 @@ final class RemoteInput {
     private let sink: Sink
     private let keyboardSink: Sink
     private let now: () -> TimeInterval
+    private let timerQueue: DispatchQueue
     // A real HID-state source for pointer/mouse/scroll/touch/tablet: menu
     // tracking treats sourceless synthetic clicks as malformed.
     private let source = CGEventSource(stateID: .hidSystemState)
@@ -154,6 +189,8 @@ final class RemoteInput {
     private var lastPoint = CGPoint.zero
     private var lastNorm = CGPoint(x: 0.5, y: 0.5)
     private var hasLastPoint = false
+    private var pointerDeltaRemX = 0.0
+    private var pointerDeltaRemY = 0.0
     private var flags: CGEventFlags = []
     private var scrollX = 0.0, scrollY = 0.0
     private var scrollActive = false
@@ -165,6 +202,9 @@ final class RemoteInput {
     private var lastDisplayQueryTime = 0.0
     private var cachedDisplays: [CGRect] = []
     private var cachedBounds = CGRect.zero
+    private var cachedLayouts: [Data] = []
+    private var cachedKeyboardType: UInt32 = 0
+    private var doubleClickInterval: TimeInterval = 0.5
     private var activityAssertion: IOPMAssertionID = 0
 
     // Active stylus / pen-display state
@@ -194,7 +234,7 @@ final class RemoteInput {
     private var touchLegacyDown = false
     private var longPressTimer: DispatchSourceTimer?
 
-    init(displayID: CGDirectDisplayID) {
+    init(displayID: CGDirectDisplayID, queue: DispatchQueue = .main) {
         bounds = { CGDisplayBounds(displayID) }
         displays = {
             var count: UInt32 = 0
@@ -205,6 +245,15 @@ final class RemoteInput {
         }
         live = true
         now = { ProcessInfo.processInfo.systemUptime }
+        timerQueue = queue
+        if Thread.isMainThread {
+            let snap = KeyMapping.snapshotKeyboardLayouts()
+            cachedLayouts = snap.layouts
+            cachedKeyboardType = snap.keyboardType
+            doubleClickInterval = NSEvent.doubleClickInterval
+        }
+        source?.localEventsSuppressionInterval = 0
+        keyboardSource?.localEventsSuppressionInterval = 0
         sink = { event in
             guard AXIsProcessTrusted() else { return }
             event.post(tap: .cghidEventTap)
@@ -226,6 +275,7 @@ final class RemoteInput {
         self.displays = { [bounds()] }
         self.live = false
         self.now = now
+        self.timerQueue = .main
         self.sink = sink
         self.keyboardSink = sink
         self.virtualKeyboard = virtualKeyboard
@@ -417,7 +467,8 @@ final class RemoteInput {
     private func nextClickCount(for button: Int, at point: CGPoint, maxRadius: Double = 4) -> Int64 {
         let currentTime = now(), previous = lastClickPoint[button] ?? point
         let close = hypot(point.x - previous.x, point.y - previous.y) <= maxRadius
-        let soon = currentTime - (lastClickTime[button] ?? -100) <= NSEvent.doubleClickInterval
+        let interval = live ? doubleClickInterval : NSEvent.doubleClickInterval
+        let soon = currentTime - (lastClickTime[button] ?? -100) <= interval
         let count: Int64 = soon && close ? min(3, (clickCounts[button] ?? 0) + 1) : 1
         clickCounts[button] = count
         lastClickTime[button] = currentTime
@@ -706,7 +757,7 @@ final class RemoteInput {
     private func armLongPress(for id: Int) {
         disarmLongPress()
         guard live else { return }
-        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let timer = DispatchSource.makeTimerSource(queue: timerQueue)
         timer.schedule(deadline: .now() + Self.longPressDuration)
         timer.setEventHandler { [weak self] in
             self?.tickLongPress()
@@ -1204,7 +1255,10 @@ final class RemoteInput {
                     )
                 } else {
                     if sym == 0 { return }
-                    mapped = try KeyMapping.logical(sym, flags: before)
+                    mapped = try KeyMapping.logical(
+                        sym, flags: before,
+                        cachedLayouts: cachedLayouts.isEmpty ? nil : cachedLayouts,
+                        keyboardType: cachedLayouts.isEmpty ? nil : cachedKeyboardType)
                     mapped.modifier = KeyMapping.modifierBit(sym)
                 }
                 held[identity] = mapped
@@ -1222,6 +1276,10 @@ final class RemoteInput {
             let currentTime = now()
             let syncCursor = !hasLastPoint || (live && currentTime - lastPointerTime > 0.3)
             lastPointerTime = currentTime
+            if syncCursor {
+                pointerDeltaRemX = 0.0
+                pointerDeltaRemY = 0.0
+            }
             var dx = 0.0, dy = 0.0
             if object["dx"] != nil || object["dy"] != nil {
                 dx = object["dx"] == nil ? 0 : try Wire.number(object, "dx", -16384...16384)
@@ -1251,12 +1309,18 @@ final class RemoteInput {
                 lastNorm = CGPoint(x: x, y: y)
                 lastPoint = projectToDisplays(CGPoint(x: lastPoint.x + dx, y: lastPoint.y + dy))
             }
+            pointerDeltaRemX += dx
+            pointerDeltaRemY += dy
+            let intDx = Int64(pointerDeltaRemX.rounded())
+            let intDy = Int64(pointerDeltaRemY.rounded())
+            pointerDeltaRemX -= Double(intDx)
+            pointerDeltaRemY -= Double(intDy)
             let button = buttons.contains(272) ? 272 : buttons.contains(273) ? 273 : 274
             let cgButton: CGMouseButton = button == 272 ? .left : button == 273 ? .right : .center
             let eventType: CGEventType = buttons.isEmpty ? .mouseMoved : button == 272 ? .leftMouseDragged : button == 273 ? .rightMouseDragged : .otherMouseDragged
             if let event = CGEvent(mouseEventSource: source, mouseType: eventType, mouseCursorPosition: lastPoint, mouseButton: cgButton) {
-                event.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
-                event.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+                event.setIntegerValueField(.mouseEventDeltaX, value: intDx)
+                event.setIntegerValueField(.mouseEventDeltaY, value: intDy)
                 event.flags = eventFlags(flags); sink(event)
             }
         case "button":
@@ -1328,7 +1392,7 @@ final class RemoteInput {
             }
             let cgPhase: Int64 = wheel ? 0 : [0: 0, 1: 1, 2: 2, 3: 4, 4: 8][phase]!
             let continuous: Int64 = wheel || (phase == 0 && origin == 0) ? 0 : 1
-            let rect = bounds()
+            let rect = try activeVirtualBounds()
             guard rect.width > 0 else { throw SenderError("Virtual display is unavailable") }
             let dx = rawX * scrollScale, dy = rawY * scrollScale
             scrollX += dx; scrollY += dy
@@ -1387,5 +1451,6 @@ final class RemoteInput {
         for button in buttons { mouse(button, false, at: lastPoint, cancelled: true) }
         buttons.removeAll()
         scrollX = 0; scrollY = 0
+        pointerDeltaRemX = 0.0; pointerDeltaRemY = 0.0
     }
 }

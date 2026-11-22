@@ -37,8 +37,12 @@ struct Options {
 
 @available(macOS 14.0, *)
 final class Sender {
+    private static let inputTypes: Set<String> = ["key", "pointer", "button", "scroll", "cancel", "touch", "tablet"]
     private let transport: SecureTransport
+    private let inputQueue = DispatchQueue(label: "locachy.macos.input", qos: .userInteractive)
+    private let captureLock = NSLock()
     private var capture: CaptureSession?
+    private var inputCapture: CaptureSession?
     private var activePanel: Panel?
     private var startTask: Task<Void, Never>?
     private var finished = false
@@ -50,13 +54,40 @@ final class Sender {
         // the interface index. Advertisements are not authorization.
         try LinkInterfaces.require(endpoint.interface, index: endpoint.interfaceIndex)
         transport = try SecureTransport(endpoint: endpoint, key: key)
-        transport.onControl = { [weak self] object in DispatchQueue.main.async { self?.control(object) } }
+        transport.onControl = { [weak self] object in
+            guard let self else { return }
+            if let type = object["type"] as? String, Self.inputTypes.contains(type) {
+                self.inputQueue.async { [weak self] in self?.handleRemoteInput(object, type: type) }
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.control(object) }
+            }
+        }
         transport.onEnd = { [weak self] reason in DispatchQueue.main.async { self?.finish(reason, code: 1) } }
     }
 
     func run() {
         SenderLog.info("Connecting over the selected Thunderbolt link")
         transport.start()
+    }
+
+    private func handleRemoteInput(_ object: [String: Any], type: String) {
+        captureLock.lock()
+        let session = inputCapture
+        captureLock.unlock()
+        guard let session else { return }
+        do {
+            try session.handleInput(object)
+        } catch {
+            if type == "key" {
+                let code = object["code"].map { "\($0)" } ?? "nil"
+                let sym = object["keysym"].map { "\($0)" } ?? "nil"
+                SenderLog.info("Ignored unmapped key (code=\(code) keysym=\(sym)): \(error)")
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.finish("Rejected malformed remote input", code: 1)
+                }
+            }
+        }
     }
 
     private func control(_ object: [String: Any]) {
@@ -72,8 +103,11 @@ final class Sender {
                 activePanel = panel
                 let acceptedInput = Wire.capabilities + Wire.optionalCapabilities.filter { panel.supportedInput.contains($0) }
                 transport.sendObject(["type": "welcome", "locachy": 1, "extended": true, "input": acceptedInput])
-                let session = CaptureSession(transport: transport, panel: panel)
+                let session = CaptureSession(transport: transport, panel: panel, inputQueue: inputQueue)
                 capture = session
+                captureLock.lock()
+                inputCapture = session
+                captureLock.unlock()
                 startTask = Task { @MainActor in
                     do {
                         try await session.start()
@@ -86,15 +120,6 @@ final class Sender {
                 transport.sendObject(pong)
             case "kf": capture?.requestKeyframe()
             case "closing", "sleeping": finish("Receiver ended the session", code: 0)
-            case "key", "pointer", "button", "scroll", "cancel", "touch", "tablet":
-                guard let capture else { return }
-                MainActor.assumeIsolated {
-                    do { try capture.handleInput(object) }
-                    catch {
-                        if type == "key" { SenderLog.info("Ignored unmapped key: \(error)") }
-                        else { self.finish("Rejected malformed remote input", code: 1) }
-                    }
-                }
             default: break
             }
         } catch { finish(String(describing: error), code: 1) }
@@ -104,6 +129,9 @@ final class Sender {
     private func finish(_ reason: String, code: Int32) {
         guard !finished else { return }
         finished = true
+        captureLock.lock()
+        inputCapture = nil
+        captureLock.unlock()
         let pendingStart = startTask
         pendingStart?.cancel(); startTask = nil
         Task { @MainActor in

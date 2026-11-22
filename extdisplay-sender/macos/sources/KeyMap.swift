@@ -138,6 +138,7 @@ enum KeyMap {
         // ISO / Application
         86:  .keyboard(0x64), // KEY_102ND
         127: .keyboard(0x65), // KEY_COMPOSE (Application)
+        139: .keyboard(0x65), // KEY_MENU (Application)
 
         // Extended function keys F13..F24 (0x68..0x73)
         183: .keyboard(0x68), // KEY_F13
@@ -154,7 +155,10 @@ enum KeyMap {
         194: .keyboard(0x73), // KEY_F24
 
         // International / JIS / Korean keys
+        85:  .keyboard(0x35), // KEY_ZENKAKUHANKAKU (Grave/Tilde)
         89:  .keyboard(0x87), // KEY_RO (International1)
+        90:  .keyboard(0x88), // KEY_KATAKANA (International2)
+        91:  .keyboard(0x88), // KEY_HIRAGANA (International2)
         93:  .keyboard(0x88), // KEY_KATAKANAHIRAGANA (International2)
         124: .keyboard(0x89), // KEY_YEN (International3)
         92:  .keyboard(0x8A), // KEY_HENKAN (International4)
@@ -170,6 +174,8 @@ enum KeyMap {
         164: .consumer(0xCD), // KEY_PLAYPAUSE
         165: .consumer(0xB6), // KEY_PREVIOUSSONG
         166: .consumer(0xB7), // KEY_STOPCD
+        224: .consumer(0x70), // KEY_BRIGHTNESSDOWN
+        225: .consumer(0x6F), // KEY_BRIGHTNESSUP
     ]
 
     static func hidKey(forEvdev code: Int) -> HidKey? {
@@ -305,9 +311,15 @@ enum KeyMap {
         73:  92, // KEY_KP9 -> kVK_ANSI_Keypad9
         121: 95, // KEY_KPCOMMA -> kVK_JIS_KeypadComma
 
-        // ISO & JIS / Korean
+        // ISO & JIS / Korean / Laptop keys
+        85:  50,  // KEY_ZENKAKUHANKAKU -> kVK_ANSI_Grave
         86:  10,  // KEY_102ND -> kVK_ISO_Section
+        90:  104, // KEY_KATAKANA -> kVK_JIS_Kana
+        91:  104, // KEY_HIRAGANA -> kVK_JIS_Kana
+        93:  104, // KEY_KATAKANAHIRAGANA -> kVK_JIS_Kana
         127: 110, // KEY_COMPOSE -> kVK_ContextualMenu
+        139: 110, // KEY_MENU -> kVK_ContextualMenu
+        143: 63,  // KEY_WAKEUP (laptop Fn) -> kVK_Function
         124: 93,  // KEY_YEN -> kVK_JIS_Yen
         89:  94,  // KEY_RO -> kVK_JIS_Underscore
         94:  102, // KEY_MUHENKAN -> kVK_JIS_Eisu

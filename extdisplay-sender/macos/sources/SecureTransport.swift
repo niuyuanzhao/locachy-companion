@@ -58,6 +58,19 @@ final class SecureTransport {
         defer { sendLock.unlock() }
         return queuedVideo < 2
     }
+    private var _onVideoDrained: (() -> Void)?
+    var onVideoDrained: (() -> Void)? {
+        get {
+            sendLock.lock()
+            defer { sendLock.unlock() }
+            return _onVideoDrained
+        }
+        set {
+            sendLock.lock()
+            _onVideoDrained = newValue
+            sendLock.unlock()
+        }
+    }
     var onReady: (() -> Void)?
     var onControl: (([String: Any]) -> Void)?
     var onEnd: ((String) -> Void)?
@@ -206,10 +219,22 @@ final class SecureTransport {
             guard allowed else { self.finish("Peer is not consuming the stream"); return }
             connection.send(content: framed, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
+                var drainHandler: (() -> Void)?
                 self.sendLock.lock()
-                if video { self.queuedVideo -= 1 } else { self.queuedControl -= 1 }
+                if video {
+                    self.queuedVideo -= 1
+                    if self.queuedVideo < 2 {
+                        drainHandler = self._onVideoDrained
+                    }
+                } else {
+                    self.queuedControl -= 1
+                }
                 self.sendLock.unlock()
-                if error != nil { self.finish("Cable send failed") }
+                if error != nil {
+                    self.finish("Cable send failed")
+                } else {
+                    drainHandler?()
+                }
             })
         }
     }

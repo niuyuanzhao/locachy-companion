@@ -346,6 +346,33 @@ final class FakeVirtualKeyboard: VirtualKeyboardBackend {
         } catch {
             check(false, "virtual HID fallback on failure: \(error)")
         }
+
+        // 4. JIS, Menu, Wakeup, and Brightness keymap additions.
+        check(KeyMap.hidKey(forEvdev: 85) == .keyboard(0x35) && KeyMap.macKeyCode(forEvdev: 85) == 50,
+              "KeyMap maps JIS Zenkaku/Hankaku (85) to HID 0x35 and macOS keycode 50")
+        check(KeyMap.hidKey(forEvdev: 90) == .keyboard(0x88) && KeyMap.macKeyCode(forEvdev: 90) == 104
+              && KeyMap.hidKey(forEvdev: 91) == .keyboard(0x88) && KeyMap.macKeyCode(forEvdev: 91) == 104,
+              "KeyMap maps JIS Katakana (90) and Hiragana (91) to HID 0x88 and macOS Kana 104")
+        check(KeyMap.hidKey(forEvdev: 139) == .keyboard(0x65) && KeyMap.macKeyCode(forEvdev: 139) == 110
+              && KeyMap.macKeyCode(forEvdev: 143) == 63,
+              "KeyMap maps Menu (139) and Wakeup (143)")
+        check(KeyMap.hidKey(forEvdev: 224) == .consumer(0x70) && KeyMap.hidKey(forEvdev: 225) == .consumer(0x6F),
+              "KeyMap maps BrightnessDown (224) and BrightnessUp (225) to USB HID consumer usages")
+        do {
+            let recorder = Recorder()
+            let fakeHid = FakeVirtualKeyboard(ready: true)
+            let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                    sink: { recorder.posted.append($0) },
+                                    virtualKeyboard: fakeHid)
+            try input.handle(["type": "key", "device": 1, "code": 225, "keysym": 0,
+                              "modifiers": 0, "locks": 0, "state": 1, "mapping": "physical"])
+            try input.handle(["type": "key", "device": 1, "code": 225, "keysym": 0,
+                              "modifiers": 0, "locks": 0, "state": 0, "mapping": "physical"])
+            check(fakeHid.consumerReports == [[0x6F], []],
+                  "BrightnessUp sends consumer usage 0x6F press and release through virtual HID")
+        } catch {
+            check(false, "Brightness consumer report: \(error)")
+        }
     }
 
     static func tabletAndTouchTests() {
@@ -616,6 +643,37 @@ final class FakeVirtualKeyboard: VirtualKeyboardBackend {
         }
         expectThrow("a cancel with a non-'all' scope is refused") {
             try input.handle(["type": "cancel", "scope": "some"])
+        }
+        // Sub-pixel pointer residual accumulation: small fractional deltas accumulate
+        // cleanly into integer CGEvent deltas while cursor position advances smoothly.
+        do {
+            let subRecorder = Recorder()
+            let subInput = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                       sink: { subRecorder.posted.append($0) })
+            try subInput.handle(["type": "pointer", "x": 0.5, "y": 0.5])
+            let startX = subRecorder.posted[0].location.x
+            let startY = subRecorder.posted[0].location.y
+            subRecorder.posted.removeAll()
+            for _ in 0..<3 {
+                try subInput.handle(["type": "pointer", "x": 0.5, "y": 0.5, "dx": 0.4, "dy": -0.4])
+            }
+            let dxs = subRecorder.posted.map { $0.getIntegerValueField(.mouseEventDeltaX) }
+            let dys = subRecorder.posted.map { $0.getIntegerValueField(.mouseEventDeltaY) }
+            let endX = subRecorder.posted.last!.location.x
+            let endY = subRecorder.posted.last!.location.y
+            check(dxs == [0, 1, 0] && dxs.reduce(0, +) == 1
+                  && dys == [0, -1, 0] && dys.reduce(0, +) == -1
+                  && abs((endX - startX) - 1.2) < 0.001
+                  && abs((endY - startY) - (-1.2)) < 0.001,
+                  "sub-pixel pointer deltas accumulate residuals without dropping fractional movement")
+            // Cancel must clear fractional residuals.
+            try subInput.handle(["type": "cancel", "scope": "all"])
+            subRecorder.posted.removeAll()
+            try subInput.handle(["type": "pointer", "x": 0.5, "y": 0.5, "dx": 0.4, "dy": 0.0])
+            check(subRecorder.posted.count == 1 && subRecorder.posted[0].getIntegerValueField(.mouseEventDeltaX) == 0,
+                  "cancel resets sub-pixel pointer delta residuals")
+        } catch {
+            check(false, "sub-pixel pointer residual accumulation: \(error)")
         }
     }
 }
