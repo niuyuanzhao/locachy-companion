@@ -50,6 +50,9 @@ enum ProtocolTests {
         pairingTests()
         scrollSemanticTests()
         modifierTransitionTests()
+        modifierRepeatTests()
+        commandSideTests()
+        capsLockTests()
         physicalAndVirtualHidTests()
         tabletAndTouchTests()
         multiSessionTests()
@@ -286,6 +289,90 @@ enum ProtocolTests {
                   "a Shift press shows Shift and its release clears it (state after the event)")
         } catch {
             check(false, "Shift transitions, state after: \(error)")
+        }
+    }
+
+    static func logicalKey(_ input: RemoteInput, _ code: Int, _ sym: Int, _ state: Int,
+                           modifiers: Int = 0, locks: Int = 0) throws {
+        try input.handle(["type": "key", "device": 1, "code": code, "keysym": sym,
+                          "modifiers": modifiers, "locks": locks, "state": state, "mapping": "logical"])
+    }
+
+    static func modifierRepeatTests() {
+        let recorder = Recorder()
+        let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                sink: { recorder.posted.append($0) })
+        do {
+            try logicalKey(input, 125, 0xffeb, 1)
+            try logicalKey(input, 125, 0xffeb, 2, modifiers: 8)
+            try logicalKey(input, 125, 0xffeb, 0, modifiers: 8)
+            check(recorder.posted.map { $0.type } == [.flagsChanged, .flagsChanged],
+                  "a Command repeat posts no flagsChanged event")
+
+            recorder.posted.removeAll()
+            // A special key needs no layout Shift/Option, so those bits must
+            // not survive from its initial press after the live state changes.
+            try logicalKey(input, 14, 0xff08, 1, modifiers: 1 | 4 | 8)
+            try logicalKey(input, 14, 0xff08, 2, modifiers: 2, locks: 1)
+            try input.handle(["type": "pointer", "x": 0.5, "y": 0.5])
+            let repeatEvent = recorder.posted.dropFirst().first
+            let liveFlags: CGEventFlags = [.maskControl, .maskAlphaShift]
+            let checkedFlags: CGEventFlags = [.maskShift, .maskAlternate, .maskCommand, .maskControl, .maskAlphaShift]
+            check(repeatEvent?.type == .keyDown && repeatEvent?.getIntegerValueField(.keyboardEventAutorepeat) == 1
+                  && repeatEvent?.flags.intersection(checkedFlags) == liveFlags,
+                  "a repeated ordinary key uses current modifiers and locks, not press-time flags")
+            check(recorder.posted.last?.type == .mouseMoved && recorder.posted.last?.flags.intersection(checkedFlags) == liveFlags,
+                  "an ordinary key repeat also updates modifiers for later pointer events")
+        } catch {
+            check(false, "modifier repeats: \(error)")
+        }
+    }
+
+    static func commandSideTests() {
+        let recorder = Recorder()
+        let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                sink: { recorder.posted.append($0) })
+        let left: UInt64 = 0x08, right: UInt64 = 0x10, noncoalesced: UInt64 = 0x100
+        func deviceFlags(_ event: CGEvent) -> UInt64 { event.flags.rawValue & (left | right | noncoalesced) }
+        do {
+            try logicalKey(input, 125, 0xffeb, 1)
+            try logicalKey(input, 126, 0xffec, 1, modifiers: 8)
+            try logicalKey(input, 125, 0xffeb, 0, modifiers: 8)
+            try input.handle(["type": "pointer", "x": 0.5, "y": 0.5])
+            try input.handle(["type": "button", "button": 272, "state": 1, "x": 0.5, "y": 0.5])
+            try input.handle(["type": "scroll", "dx": 0, "dy": -15, "phase": 2, "source": 1])
+            try logicalKey(input, 126, 0xffec, 0, modifiers: 8)
+            let transitions = recorder.posted.filter { $0.type == .flagsChanged }
+            check(transitions.map(deviceFlags) == [left | noncoalesced, left | right | noncoalesced,
+                                                   right | noncoalesced, noncoalesced],
+                  "Command press and release events carry the currently held left/right device bits")
+            check(transitions.map { $0.flags.contains(.maskCommand) } == [true, true, true, false],
+                  "releasing Left Command keeps Command set until Right Command is released")
+            let pointerEvents = recorder.posted.filter { $0.type != .flagsChanged }
+            check(pointerEvents.map { $0.type } == [.mouseMoved, .leftMouseDown, .scrollWheel]
+                  && pointerEvents.allSatisfy { $0.flags.contains(.maskCommand) && deviceFlags($0) == (right | noncoalesced) },
+                  "motion, button and scroll events retain the held Right Command flags")
+        } catch {
+            check(false, "Command sides: \(error)")
+        }
+    }
+
+    static func capsLockTests() {
+        let recorder = Recorder()
+        let input = RemoteInput(bounds: { CGRect(x: 0, y: 0, width: 1920, height: 1200) },
+                                sink: { recorder.posted.append($0) })
+        do {
+            try logicalKey(input, 58, 0xffe5, 1)
+            try logicalKey(input, 58, 0xffe5, 2, locks: 1)
+            try logicalKey(input, 58, 0xffe5, 0, locks: 1)
+            try logicalKey(input, 58, 0xffe5, 1, locks: 1)
+            try logicalKey(input, 58, 0xffe5, 2)
+            try logicalKey(input, 58, 0xffe5, 0)
+            check(recorder.posted.map { $0.type } == Array(repeating: .flagsChanged, count: 4)
+                  && recorder.posted.map { $0.flags.contains(.maskAlphaShift) } == [true, true, false, false],
+                  "Caps Lock toggles on press, stays unchanged on release and never repeats")
+        } catch {
+            check(false, "Caps Lock transitions: \(error)")
         }
     }
 
