@@ -3,18 +3,36 @@ import AppKit
 import Foundation
 
 struct Options {
-    let endpoint: CableEndpoint?
-    let check: Bool
-    let graphical: Bool
+    enum Mode {
+        case graphical
+        case check
+        case connect(endpoint: CableEndpoint, identity: String, hostID: String?)
+        case importPeer(token: String?)
+        case listPeers
+        case forgetPeer(hostID: String)
+    }
+
+    let mode: Mode
 
     init(_ arguments: [String]) throws {
-        if arguments.isEmpty { endpoint = nil; check = false; graphical = true; return }
-        if arguments == ["--check"] { endpoint = nil; check = true; graphical = false; return }
+        if arguments.isEmpty { mode = .graphical; return }
+        if arguments == ["--check"] { mode = .check; return }
+        if arguments == ["--list-peers"] { mode = .listPeers; return }
+        if arguments.count == 2 && (arguments[0] == "--pair-token" || arguments[0] == "--import-peer") {
+            // "-" reads the token from stdin so the long-lived secret never appears in argv.
+            mode = .importPeer(token: arguments[1] == "-" ? nil : arguments[1])
+            return
+        }
+        if arguments.count == 2 && arguments[0] == "--forget-peer" {
+            mode = .forgetPeer(hostID: arguments[1])
+            return
+        }
         var values: [String: String] = [:]
         var index = 0
         while index < arguments.count {
             let name = arguments[index]
-            guard ["--interface", "--address", "--port"].contains(name), index + 1 < arguments.count,
+            guard ["--interface", "--address", "--port", "--identity", "--host-id"].contains(name),
+                  index + 1 < arguments.count,
                   values[name] == nil else { throw SenderError(Self.usage) }
             values[name] = arguments[index + 1]
             index += 2
@@ -22,14 +40,20 @@ struct Options {
         guard let interface = values["--interface"], let address = values["--address"],
               let portText = values["--port"], let port = UInt16(portText)
         else { throw SenderError(Self.usage) }
-        endpoint = try CableEndpoint(host: address, port: port, interface: interface)
-        check = false
-        graphical = false
+        let identity = values["--identity"] ?? Wire.identity
+        guard PeerStore.validIdentity(identity) else { throw SenderError("Invalid PSK identity") }
+        let hostID = values["--host-id"]
+        if let hostID, !PeerStore.validHostID(hostID) { throw SenderError("Invalid host identifier") }
+        let endpoint = try CableEndpoint(host: address, port: port, interface: interface)
+        mode = .connect(endpoint: endpoint, identity: identity, hostID: hostID)
     }
 
     static let usage = """
     usage: locachy-macos-sender
-           locachy-macos-sender --interface IFACE --address LINK_LOCAL --port PORT
+           locachy-macos-sender --interface IFACE --address LINK_LOCAL --port PORT [--identity ID] [--host-id HOSTID]
+           locachy-macos-sender --pair-token -        (token read from stdin)
+           locachy-macos-sender --list-peers
+           locachy-macos-sender --forget-peer HOSTID
            locachy-macos-sender --check
     No arguments opens automatic Thunderbolt discovery and the connection window.
     """
@@ -39,21 +63,27 @@ struct Options {
 final class Sender {
     private static let inputTypes: Set<String> = ["key", "pointer", "button", "scroll", "cancel", "touch", "tablet"]
     private let transport: SecureTransport
-    private let inputQueue = DispatchQueue(label: "locachy.macos.input", qos: .userInteractive)
+    private let inputCoordinator: InputCoordinator
+    private let discoveredHostID: String?
     private let captureLock = NSLock()
     private var capture: CaptureSession?
     private var inputCapture: CaptureSession?
     private var activePanel: Panel?
     private var startTask: Task<Void, Never>?
     private var finished = false
-    var onActive: (() -> Void)?
-    var onEnd: ((String, Int32) -> Void)?
+    var onActive: ((Panel) -> Void)?
+    var onPairGrant: ((String, String, String, String) -> Void)?
+    var onEnd: ((String, Int32, Bool) -> Void)?
 
-    init(endpoint: CableEndpoint, key: Data) throws {
+    init(endpoint: CableEndpoint, key: Data, identity: String = Wire.identity,
+         discoveredHostID: String? = nil,
+         inputCoordinator: InputCoordinator = .shared) throws {
         // Revalidate immediately before dialing, including bridge members and
         // the interface index. Advertisements are not authorization.
         try LinkInterfaces.require(endpoint.interface, index: endpoint.interfaceIndex)
-        transport = try SecureTransport(endpoint: endpoint, key: key)
+        self.inputCoordinator = inputCoordinator
+        self.discoveredHostID = discoveredHostID
+        transport = try SecureTransport(endpoint: endpoint, key: key, identity: identity)
         transport.onControl = { [weak self] object in
             guard let self else { return }
             if let type = object["type"] as? String {
@@ -74,13 +104,15 @@ final class Sender {
                     return
                 }
                 if Self.inputTypes.contains(type) {
-                    self.inputQueue.async { [weak self] in self?.handleRemoteInput(object, type: type) }
+                    self.inputCoordinator.queue.async { [weak self] in self?.handleRemoteInput(object, type: type) }
                     return
                 }
             }
             DispatchQueue.main.async { [weak self] in self?.control(object) }
         }
-        transport.onEnd = { [weak self] reason in DispatchQueue.main.async { self?.finish(reason, code: 1) } }
+        transport.onEnd = { [weak self] reason, authFailed in
+            DispatchQueue.main.async { self?.finish(reason, code: 1, authFailed: authFailed) }
+        }
     }
 
     func run() {
@@ -113,15 +145,25 @@ final class Sender {
         do {
             switch type {
             case "hello":
-                let panel = try Panel(hello: object)
+                let panel = try Panel(hello: object, discoveredHostID: discoveredHostID)
                 if let current = activePanel {
                     if current != panel { finish("Receiver panel changed; reconnect to resize", code: 0) }
                     return
                 }
                 activePanel = panel
+                if let hostID = panel.hostID,
+                   let grantIdentity = panel.peerGrantIdentity,
+                   let grantCode = panel.peerGrantCode {
+                    onPairGrant?(hostID, panel.displayLabel, grantIdentity, grantCode)
+                }
                 let acceptedInput = Wire.capabilities + Wire.optionalCapabilities.filter { panel.supportedInput.contains($0) }
                 transport.sendObject(["type": "welcome", "locachy": 1, "extended": true, "input": acceptedInput])
-                let session = CaptureSession(transport: transport, panel: panel, inputQueue: inputQueue)
+                let session = CaptureSession(
+                    transport: transport,
+                    panel: panel,
+                    hostIDOverride: discoveredHostID,
+                    inputCoordinator: inputCoordinator
+                )
                 capture = session
                 captureLock.lock()
                 inputCapture = session
@@ -129,9 +171,21 @@ final class Sender {
                 startTask = Task { @MainActor in
                     do {
                         try await session.start()
-                        if !self.finished { self.onActive?() }
+                        if !self.finished { self.onActive?(panel) }
                     } catch { self.finish(String(describing: error), code: 1) }
                 }
+            case "pairGrant":
+                guard let panel = activePanel,
+                      let hostID = (object["hostId"] as? String ?? object["hostid"] as? String ?? panel.hostID),
+                      PeerStore.validHostID(hostID),
+                      let grantIdentity = (object["peerIdentity"] as? String ?? object["identity"] as? String),
+                      PeerStore.validIdentity(grantIdentity),
+                      let grantCode = (object["peerKey"] as? String ?? object["peerCode"] as? String ?? object["code"] as? String)
+                else { break }
+                var decoded = try PeerStore.decodePSK(grantCode)
+                decoded.resetBytes(in: 0..<decoded.count)
+                let label = PeerStore.sanitizeDisplayName(object["name"] as? String, fallback: panel.displayLabel)
+                onPairGrant?(hostID, label, grantIdentity, grantCode)
             case "ping":
                 var pong: [String: Any] = ["type": "pong", "mt": Int(Date().timeIntervalSince1970 * 1000)]
                 if object["t"] != nil { pong["t"] = try Wire.integer(object, "t", 0...Int.max) }
@@ -144,7 +198,7 @@ final class Sender {
     }
 
     func stop() { finish("Stopped by the Mac", code: 0) }
-    private func finish(_ reason: String, code: Int32) {
+    private func finish(_ reason: String, code: Int32, authFailed: Bool = false) {
         guard !finished else { return }
         finished = true
         captureLock.lock()
@@ -164,7 +218,7 @@ final class Sender {
             self.transport.stop(reason)
             // The same cleanup serves both GUI retry and the one-shot CLI.
             try? await Task.sleep(for: .milliseconds(250))
-            self.onEnd?(reason, code)
+            self.onEnd?(reason, code, authFailed)
         }
     }
 }
@@ -176,28 +230,64 @@ enum SenderMain {
     static func main() {
         do {
             let options = try Options(Array(CommandLine.arguments.dropFirst()))
-            if options.check {
+            switch options.mode {
+            case .check:
                 let available = ["CGVirtualDisplay", "CGVirtualDisplayDescriptor", "CGVirtualDisplaySettings", "CGVirtualDisplayMode"]
                     .allSatisfy { NSClassFromString($0) != nil }
                 print(available ? "PASS: CGVirtualDisplay classes are present"
                                 : "FAIL: CGVirtualDisplay is unavailable on this macOS")
                 exit(available ? 0 : 1)
-            }
-            guard #available(macOS 14.0, *) else { throw SenderError("macOS 14 or later is required") }
-            if options.graphical {
+            case .importPeer(let token):
+                let rawToken = token ?? (readLine(strippingNewline: true) ?? "")
+                let peer = try PeerStore.parsePairingToken(rawToken)
+                try PeerStore.shared.save(peer)
+                print("Saved pairing credential for \(peer.displayName) (host=\(peer.hostID), identity=\(peer.identity))")
+                exit(0)
+            case .listPeers:
+                let peers = PeerStore.shared.all()
+                if peers.isEmpty {
+                    print("No paired LOCachy receivers stored.")
+                } else {
+                    for peer in peers {
+                        print("\(peer.hostID)\t\(peer.displayName)\t\(peer.identity)\tlastUsed=\(peer.lastUsedAt)")
+                    }
+                }
+                exit(0)
+            case .forgetPeer(let hostID):
+                guard PeerStore.validHostID(hostID) else { throw SenderError("Invalid host identifier") }
+                if PeerStore.shared.remove(hostID: hostID) {
+                    print("Removed stored credential for \(hostID)")
+                    exit(0)
+                } else {
+                    fputs("locachy-macos: No stored credential for \(hostID)\n", stderr)
+                    exit(1)
+                }
+            case .graphical:
+                guard #available(macOS 14.0, *) else { throw SenderError("macOS 14 or later is required") }
                 let app = NSApplication.shared
                 let controller = ConnectionWindow()
                 app.delegate = controller
                 app.setActivationPolicy(.accessory)
                 withExtendedLifetime(controller) { app.run() }
-            } else {
-                guard let endpoint = options.endpoint else { throw SenderError(Options.usage) }
+            case .connect(let endpoint, let cliIdentity, let hostID):
+                guard #available(macOS 14.0, *) else { throw SenderError("macOS 14 or later is required") }
                 try LinkInterfaces.require(endpoint.interface, index: endpoint.interfaceIndex)
-                var key = try PairingCode.read()
+                let resolvedIdentity: String
+                var key: Data
+                if let hostID, let stored = PeerStore.shared.lookup(hostID: hostID), cliIdentity == Wire.identity {
+                    key = try PeerStore.decodePSK(stored.pskBase32)
+                    resolvedIdentity = stored.identity
+                } else {
+                    key = try PairingCode.read()
+                    resolvedIdentity = cliIdentity
+                }
                 defer { key.resetBytes(in: 0..<key.count) }
-                let sender = try Sender(endpoint: endpoint, key: key)
+                let sender = try Sender(endpoint: endpoint, key: key, identity: resolvedIdentity, discoveredHostID: hostID)
                 key.resetBytes(in: 0..<key.count)
-                sender.onEnd = { _, code in exit(code) }
+                sender.onEnd = { _, code, _ in
+                    InputCoordinator.shared.shutdown()
+                    exit(code)
+                }
                 for number in [SIGINT, SIGTERM, SIGHUP] {
                     signal(number, SIG_IGN)
                     let source = DispatchSource.makeSignalSource(signal: number, queue: .main)

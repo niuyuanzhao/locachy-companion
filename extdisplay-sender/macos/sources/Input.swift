@@ -141,6 +141,348 @@ enum KeyMapping {
     }
 }
 
+// Process-wide input coordinator shared across concurrent RemoteInput sessions.
+// Owns a single VirtualKeyboardClient (matching HidHelperServer's single client
+// slot), merges held HID and fallback keyboard state across all active sessions,
+// shares global pointer position and mouse button refcounts so interleaved
+// motion never jumps or drops drags, and assigns distinct Quartz tablet IDs.
+final class InputCoordinator {
+    static let shared = InputCoordinator(live: true)
+
+    struct SessionHidState {
+        var modifiers: UInt8 = 0
+        var keys = Set<UInt16>()
+        var consumers = Set<UInt16>()
+        var isEmpty: Bool { modifiers == 0 && keys.isEmpty && consumers.isEmpty }
+    }
+
+    let queue = DispatchQueue(label: "locachy.macos.input", qos: .userInteractive)
+    private let lock = NSLock()
+    private let live: Bool
+    private var virtualKeyboard: VirtualKeyboardBackend?
+    private var ownsVirtualKeyboard: Bool
+    private var nextSessionID: UInt64 = 0
+    private var nextTabletDeviceID: Int64 = 0
+    private var activeSessions = Set<UInt64>()
+    private var sessionHid: [UInt64: SessionHidState] = [:]
+    private var sessionFallbackKeys: [UInt64: [KeyIdentity: MappedKey]] = [:]
+    private var sessionButtons: [UInt64: Set<Int>] = [:]
+    private var sharedLastPoint = CGPoint.zero
+    private var sharedHasLastPoint = false
+    private var sharedLastPointerTime = 0.0
+
+    init(live: Bool = false, virtualKeyboard: VirtualKeyboardBackend? = nil) {
+        self.live = live
+        self.virtualKeyboard = virtualKeyboard
+        self.ownsVirtualKeyboard = live && virtualKeyboard == nil
+    }
+
+    var backend: VirtualKeyboardBackend? {
+        lock.lock()
+        defer { lock.unlock() }
+        return ensureBackendLocked()
+    }
+
+    private func ensureBackendLocked() -> VirtualKeyboardBackend? {
+        if let existing = virtualKeyboard { return existing }
+        guard live else { return nil }
+        let client = VirtualKeyboardClient()
+        client.start()
+        virtualKeyboard = client
+        ownsVirtualKeyboard = true
+        return client
+    }
+
+    func registerSession() -> (sessionID: UInt64, tabletDeviceID: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        nextSessionID += 1
+        nextTabletDeviceID += 1
+        let sid = nextSessionID
+        let tid = nextTabletDeviceID
+        activeSessions.insert(sid)
+        _ = ensureBackendLocked()
+        return (sid, tid)
+    }
+
+    func unregisterSession(_ sessionID: UInt64) {
+        lock.lock()
+        activeSessions.remove(sessionID)
+        sessionHid.removeValue(forKey: sessionID)
+        sessionFallbackKeys.removeValue(forKey: sessionID)
+        sessionButtons.removeValue(forKey: sessionID)
+        lock.unlock()
+    }
+
+    func shutdown() {
+        lock.lock()
+        sessionHid.removeAll()
+        sessionFallbackKeys.removeAll()
+        sessionButtons.removeAll()
+        let owned = ownsVirtualKeyboard ? virtualKeyboard : nil
+        if ownsVirtualKeyboard { virtualKeyboard = nil }
+        lock.unlock()
+        owned?.reset()
+        owned?.stop()
+    }
+
+    // MARK: - Merged HID keyboard state
+
+    private func unionHidLocked() -> (modifiers: UInt8, keys: [UInt16], consumers: [UInt16], empty: Bool) {
+        var modifiers: UInt8 = 0
+        var keys = Set<UInt16>()
+        var consumers = Set<UInt16>()
+        for state in sessionHid.values {
+            modifiers |= state.modifiers
+            keys.formUnion(state.keys)
+            consumers.formUnion(state.consumers)
+        }
+        let limit = min(32, HidHelperIPC.maxKeys)
+        let sortedKeys = keys.sorted()
+        let sortedConsumers = consumers.sorted()
+        return (
+            modifiers,
+            sortedKeys.count > limit ? Array(sortedKeys.prefix(limit)) : sortedKeys,
+            sortedConsumers.count > limit ? Array(sortedConsumers.prefix(limit)) : sortedConsumers,
+            modifiers == 0 && keys.isEmpty && consumers.isEmpty
+        )
+    }
+
+    static func hidSemanticFlags(from modifiers: UInt8) -> CGEventFlags {
+        var result: CGEventFlags = []
+        if modifiers & (0x02 | 0x20) != 0 { result.insert(.maskShift) }
+        if modifiers & (0x01 | 0x10) != 0 { result.insert(.maskControl) }
+        if modifiers & (0x04 | 0x40) != 0 { result.insert(.maskAlternate) }
+        if modifiers & (0x08 | 0x80) != 0 { result.insert(.maskCommand) }
+        return result
+    }
+
+    static func hidState(from heldHid: [KeyIdentity: HidKey]) -> SessionHidState {
+        var state = SessionHidState()
+        for hid in heldHid.values {
+            switch hid {
+            case .modifier(let bit): state.modifiers |= bit
+            case .keyboard(let usage): state.keys.insert(usage)
+            case .consumer(let usage): state.consumers.insert(usage)
+            }
+        }
+        return state
+    }
+
+    func updateHid(sessionID: UInt64, heldHid: [KeyIdentity: HidKey], changed: HidKey) -> Bool {
+        lock.lock()
+        let state = Self.hidState(from: heldHid)
+        if state.isEmpty {
+            sessionHid.removeValue(forKey: sessionID)
+        } else {
+            sessionHid[sessionID] = state
+        }
+        let union = unionHidLocked()
+        let vk = ensureBackendLocked()
+        lock.unlock()
+
+        guard let vk else { return false }
+        let ok: Bool
+        switch changed {
+        case .modifier, .keyboard:
+            ok = vk.sendKeyboardReport(modifiers: union.modifiers, keys: union.keys)
+        case .consumer:
+            ok = vk.sendConsumerReport(usages: union.consumers)
+        }
+        if !ok {
+            // The helper dropped this report. Forget only this session's keys,
+            // reset the helper, then re-send what other sessions still hold.
+            lock.lock()
+            sessionHid.removeValue(forKey: sessionID)
+            let remaining = unionHidLocked()
+            lock.unlock()
+            vk.reset()
+            if !remaining.empty {
+                _ = vk.sendKeyboardReport(modifiers: remaining.modifiers, keys: remaining.keys)
+                if !remaining.consumers.isEmpty {
+                    _ = vk.sendConsumerReport(usages: remaining.consumers)
+                }
+            }
+        }
+        return ok
+    }
+
+    // Clears only this session's HID keys. Sends the remaining union if another
+    // session still holds keys, and calls vk.reset() only when the union is empty.
+    func clearHid(sessionID: UInt64, hadKeys: Bool, forceResetIfEmpty: Bool = true) {
+        lock.lock()
+        let previous = sessionHid.removeValue(forKey: sessionID)
+        let hadState = hadKeys || (previous != nil && !previous!.isEmpty)
+        let union = unionHidLocked()
+        let sessionCount = activeSessions.count
+        let vk = virtualKeyboard
+        lock.unlock()
+
+        guard let vk else { return }
+        if union.empty {
+            if hadState || (forceResetIfEmpty && sessionCount <= 1) {
+                vk.reset()
+            }
+            return
+        }
+        guard hadState else { return }
+        let prevModOrKey = (previous?.modifiers ?? 0) != 0 || !(previous?.keys.isEmpty ?? true)
+        let prevConsumer = !(previous?.consumers.isEmpty ?? true)
+        let sent = (!prevModOrKey || vk.sendKeyboardReport(modifiers: union.modifiers, keys: union.keys))
+            && (!prevConsumer || vk.sendConsumerReport(usages: union.consumers))
+        if !sent {
+            // The helper dropped the update: reset it and re-send what the other sessions hold.
+            vk.reset()
+            _ = vk.sendKeyboardReport(modifiers: union.modifiers, keys: union.keys)
+            if !union.consumers.isEmpty {
+                _ = vk.sendConsumerReport(usages: union.consumers)
+            }
+        }
+    }
+
+    // MARK: - Merged fallback keyboard state & modifier flags
+
+    func setFallbackKeys(sessionID: UInt64, held: [KeyIdentity: MappedKey]) {
+        lock.lock()
+        if held.isEmpty {
+            sessionFallbackKeys.removeValue(forKey: sessionID)
+        } else {
+            sessionFallbackKeys[sessionID] = held
+        }
+        lock.unlock()
+    }
+
+    func otherSessionsHoldFallbackKey(_ mapped: MappedKey, excluding sessionID: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        for (sid, keys) in sessionFallbackKeys where sid != sessionID {
+            if keys.values.contains(where: { $0.code == mapped.code && $0.text == mapped.text }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    func otherSessionsHoldKeyCode(_ code: CGKeyCode, excluding sessionID: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        for (sid, keys) in sessionFallbackKeys where sid != sessionID {
+            if keys.values.contains(where: { $0.code == code }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    func mergedSemanticModifierFlags() -> CGEventFlags {
+        lock.lock()
+        defer { lock.unlock() }
+        var result = Self.hidSemanticFlags(from: unionHidLocked().modifiers)
+        for keys in sessionFallbackKeys.values {
+            for mapped in keys.values {
+                result.formUnion(mapped.modifier)
+            }
+        }
+        return result
+    }
+
+    func mergedDeviceModifierFlags() -> CGEventFlags {
+        lock.lock()
+        defer { lock.unlock() }
+        var raw: UInt64 = 0
+        for keys in sessionFallbackKeys.values {
+            for mapped in keys.values {
+                switch mapped.code {
+                case 55: raw |= 0x08       // NX_DEVICELCMDKEYMASK
+                case 54: raw |= 0x10       // NX_DEVICERCMDKEYMASK
+                case 56: raw |= 0x02       // NX_DEVICELSHIFTKEYMASK
+                case 60: raw |= 0x04       // NX_DEVICERSHIFTKEYMASK
+                case 59: raw |= 0x01       // NX_DEVICELCTLKEYMASK
+                case 62: raw |= 0x2000     // NX_DEVICERCTLKEYMASK
+                case 58: raw |= 0x20       // NX_DEVICELALTKEYMASK
+                case 61: raw |= 0x40       // NX_DEVICERALTKEYMASK
+                default: break
+                }
+            }
+        }
+        let hidMods = unionHidLocked().modifiers
+        if hidMods & 0x01 != 0 { raw |= 0x01 }   // NX_DEVICELCTLKEYMASK
+        if hidMods & 0x02 != 0 { raw |= 0x02 }   // NX_DEVICELSHIFTKEYMASK
+        if hidMods & 0x04 != 0 { raw |= 0x20 }   // NX_DEVICELALTKEYMASK
+        if hidMods & 0x08 != 0 { raw |= 0x08 }   // NX_DEVICELCMDKEYMASK
+        if hidMods & 0x10 != 0 { raw |= 0x2000 } // NX_DEVICERCTLKEYMASK
+        if hidMods & 0x20 != 0 { raw |= 0x04 }   // NX_DEVICERSHIFTKEYMASK
+        if hidMods & 0x40 != 0 { raw |= 0x40 }   // NX_DEVICERALTKEYMASK
+        if hidMods & 0x80 != 0 { raw |= 0x10 }   // NX_DEVICERCMDKEYMASK
+        return CGEventFlags(rawValue: raw)
+    }
+
+    func pointerSnapshot() -> (point: CGPoint, hasPoint: Bool, lastTime: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (sharedLastPoint, sharedHasLastPoint, sharedLastPointerTime)
+    }
+
+    func updatePointer(point: CGPoint, time: TimeInterval? = nil) {
+        lock.lock()
+        sharedLastPoint = point
+        sharedHasLastPoint = true
+        if let time { sharedLastPointerTime = time }
+        lock.unlock()
+    }
+
+    func markPointerValid() {
+        lock.lock()
+        sharedHasLastPoint = true
+        lock.unlock()
+    }
+
+    func updatePointerTime(_ time: TimeInterval) {
+        lock.lock()
+        sharedLastPointerTime = time
+        lock.unlock()
+    }
+
+    func heldButtonCount(sessionID: UInt64) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionButtons[sessionID]?.count ?? 0
+    }
+
+    func setButton(_ button: Int, down: Bool, sessionID: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let wasGlobal = sessionButtons.values.contains(where: { $0.contains(button) })
+        var mine = sessionButtons[sessionID] ?? []
+        let changed = down ? mine.insert(button).inserted : mine.remove(button) != nil
+        if mine.isEmpty {
+            sessionButtons.removeValue(forKey: sessionID)
+        } else {
+            sessionButtons[sessionID] = mine
+        }
+        guard changed else { return false }
+        let isGlobal = sessionButtons.values.contains(where: { $0.contains(button) })
+        return down ? !wasGlobal : !isGlobal
+    }
+
+    func clearButtons(sessionID: UInt64) -> [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let mine = sessionButtons.removeValue(forKey: sessionID), !mine.isEmpty else { return [] }
+        return mine.filter { btn in
+            !sessionButtons.values.contains(where: { $0.contains(btn) })
+        }.sorted()
+    }
+
+    func globalPressedButtons() -> Set<Int> {
+        lock.lock()
+        defer { lock.unlock() }
+        var all = Set<Int>()
+        for set in sessionButtons.values { all.formUnion(set) }
+        return all
+    }
+}
+
 final class RemoteInput {
     typealias Sink = (CGEvent) -> Void
 
@@ -176,29 +518,27 @@ final class RemoteInput {
     private let keyboardSink: Sink
     private let now: () -> TimeInterval
     private let timerQueue: DispatchQueue
+    private let coordinator: InputCoordinator
+    private let sessionID: UInt64
+    private var detached = false
     // A real HID-state source for pointer/mouse/scroll/touch/tablet: menu
     // tracking treats sourceless synthetic clicks as malformed.
     private let source = CGEventSource(stateID: .hidSystemState)
     // A private-state source for fallback keyboard CGEvents posted to the
     // session tap, matching libvirtualhid and avoiding local keyboard state leaks.
     private let keyboardSource = CGEventSource(stateID: .privateState)
-    private var virtualKeyboard: VirtualKeyboardBackend?
     private var held: [KeyIdentity: MappedKey] = [:]
     private var heldHid: [KeyIdentity: HidKey] = [:]
-    private var buttons = Set<Int>()
-    private var lastPoint = CGPoint.zero
+    private var flags: CGEventFlags = []
     private var lastNorm = CGPoint(x: 0.5, y: 0.5)
-    private var hasLastPoint = false
     private var pointerDeltaRemX = 0.0
     private var pointerDeltaRemY = 0.0
-    private var flags: CGEventFlags = []
     private var scrollX = 0.0, scrollY = 0.0
     private var scrollActive = false
     private var lastClickTime = [Int: TimeInterval]()
     private var lastClickPoint = [Int: CGPoint]()
     private var clickCounts = [Int: Int64]()
     private var lastActivityTime = 0.0
-    private var lastPointerTime = 0.0
     private var lastDisplayQueryTime = 0.0
     private var cachedDisplays: [CGRect] = []
     private var cachedBounds = CGRect.zero
@@ -210,7 +550,7 @@ final class RemoteInput {
     // Active stylus / pen-display state
     private var tabletInProximity = false
     private var tabletToolType: Int64 = 1 // 1 = pen, 3 = eraser
-    private var tabletDeviceID: Int64 = 1
+    let tabletDeviceID: Int64
     private var tabletPointerID: Int64 = 1
     private var tabletUniqueID: UInt64 = 0
     private var tabletCaps: UInt32 = 0
@@ -234,7 +574,24 @@ final class RemoteInput {
     private var touchLegacyDown = false
     private var longPressTimer: DispatchSourceTimer?
 
-    init(displayID: CGDirectDisplayID, queue: DispatchQueue = .main) {
+    private var lastPoint: CGPoint {
+        get { coordinator.pointerSnapshot().point }
+        set { coordinator.updatePointer(point: newValue) }
+    }
+    private var hasLastPoint: Bool {
+        get { coordinator.pointerSnapshot().hasPoint }
+        set { if newValue { coordinator.markPointerValid() } }
+    }
+    private var lastPointerTime: TimeInterval {
+        get { coordinator.pointerSnapshot().lastTime }
+        set { coordinator.updatePointerTime(newValue) }
+    }
+
+    init(displayID: CGDirectDisplayID, coordinator: InputCoordinator = .shared, queue: DispatchQueue? = nil) {
+        self.coordinator = coordinator
+        let reg = coordinator.registerSession()
+        self.sessionID = reg.sessionID
+        self.tabletDeviceID = reg.tabletDeviceID
         bounds = { CGDisplayBounds(displayID) }
         displays = {
             var count: UInt32 = 0
@@ -245,7 +602,7 @@ final class RemoteInput {
         }
         live = true
         now = { ProcessInfo.processInfo.systemUptime }
-        timerQueue = queue
+        timerQueue = queue ?? coordinator.queue
         if Thread.isMainThread {
             let snap = KeyMapping.snapshotKeyboardLayouts()
             cachedLayouts = snap.layouts
@@ -262,15 +619,18 @@ final class RemoteInput {
             guard AXIsProcessTrusted() else { return }
             event.post(tap: .cgSessionEventTap)
         }
-        let client = VirtualKeyboardClient()
-        client.start()
-        virtualKeyboard = client
     }
     // Unit tests create CGEvents but never post, query a display or request TCC.
     init(bounds: @escaping () -> CGRect,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          sink: @escaping Sink,
-         virtualKeyboard: VirtualKeyboardBackend? = nil) {
+         virtualKeyboard: VirtualKeyboardBackend? = nil,
+         coordinator: InputCoordinator? = nil) {
+        let coord = coordinator ?? InputCoordinator(live: false, virtualKeyboard: virtualKeyboard)
+        self.coordinator = coord
+        let reg = coord.registerSession()
+        self.sessionID = reg.sessionID
+        self.tabletDeviceID = reg.tabletDeviceID
         self.bounds = bounds
         self.displays = { [bounds()] }
         self.live = false
@@ -278,18 +638,25 @@ final class RemoteInput {
         self.timerQueue = .main
         self.sink = sink
         self.keyboardSink = sink
-        self.virtualKeyboard = virtualKeyboard
+    }
+
+    func detach() {
+        guard !detached else { return }
+        detached = true
+        disarmLongPress()
+        let hadHid = !heldHid.isEmpty
+        heldHid.removeAll()
+        held.removeAll()
+        coordinator.clearHid(sessionID: sessionID, hadKeys: hadHid, forceResetIfEmpty: false)
+        coordinator.unregisterSession(sessionID)
     }
 
     deinit {
-        disarmLongPress()
-        heldHid.removeAll()
-        virtualKeyboard?.reset()
-        virtualKeyboard?.stop()
+        detach()
     }
 
     var heldCount: Int {
-        held.count + heldHid.count + buttons.count + (tabletTipDown ? 1 : 0) + tabletBarrelButtons.count + (touchLegacyDown ? 1 : 0)
+        held.count + heldHid.count + coordinator.heldButtonCount(sessionID: sessionID) + (tabletTipDown ? 1 : 0) + tabletBarrelButtons.count + (touchLegacyDown ? 1 : 0)
     }
 
     func invalidateDisplayCache() {
@@ -349,93 +716,16 @@ final class RemoteInput {
         return best
     }
 
-    private func hidModifierBitmap() -> UInt8 {
-        var mask: UInt8 = 0
-        for hid in heldHid.values {
-            if case .modifier(let bit) = hid {
-                mask |= bit
-            }
-        }
-        return mask
-    }
-
-    private func hidKeyboardUsages() -> [UInt16] {
-        var usages = Set<UInt16>()
-        for hid in heldHid.values {
-            if case .keyboard(let usage) = hid {
-                usages.insert(usage)
-            }
-        }
-        let sorted = usages.sorted()
-        let limit = min(32, HidHelperIPC.maxKeys)
-        return sorted.count > limit ? Array(sorted.prefix(limit)) : sorted
-    }
-
-    private func hidConsumerUsages() -> [UInt16] {
-        var usages = Set<UInt16>()
-        for hid in heldHid.values {
-            if case .consumer(let usage) = hid {
-                usages.insert(usage)
-            }
-        }
-        let sorted = usages.sorted()
-        let limit = min(32, HidHelperIPC.maxKeys)
-        return sorted.count > limit ? Array(sorted.prefix(limit)) : sorted
-    }
-
     private func hidSemanticFlags(from modifiers: UInt8) -> CGEventFlags {
-        var result: CGEventFlags = []
-        if modifiers & (0x02 | 0x20) != 0 { result.insert(.maskShift) }
-        if modifiers & (0x01 | 0x10) != 0 { result.insert(.maskControl) }
-        if modifiers & (0x04 | 0x40) != 0 { result.insert(.maskAlternate) }
-        if modifiers & (0x08 | 0x80) != 0 { result.insert(.maskCommand) }
-        return result
-    }
-
-    private func sendHidState(for changed: HidKey, via vk: VirtualKeyboardBackend) -> Bool {
-        switch changed {
-        case .modifier, .keyboard:
-            return vk.sendKeyboardReport(modifiers: hidModifierBitmap(), keys: hidKeyboardUsages())
-        case .consumer:
-            return vk.sendConsumerReport(usages: hidConsumerUsages())
-        }
-    }
-
-    private func deviceModifierFlags() -> CGEventFlags {
-        var raw: UInt64 = 0
-        for mapped in held.values {
-            switch mapped.code {
-            case 55: raw |= 0x08       // NX_DEVICELCMDKEYMASK
-            case 54: raw |= 0x10       // NX_DEVICERCMDKEYMASK
-            case 56: raw |= 0x02       // NX_DEVICELSHIFTKEYMASK
-            case 60: raw |= 0x04       // NX_DEVICERSHIFTKEYMASK
-            case 59: raw |= 0x01       // NX_DEVICELCTLKEYMASK
-            case 62: raw |= 0x2000     // NX_DEVICERCTLKEYMASK
-            case 58: raw |= 0x20       // NX_DEVICELALTKEYMASK
-            case 61: raw |= 0x40       // NX_DEVICERALTKEYMASK
-            default: break
-            }
-        }
-        for hid in heldHid.values {
-            if case .modifier(let bit) = hid {
-                if bit & 0x01 != 0 { raw |= 0x01 }   // NX_DEVICELCTLKEYMASK
-                if bit & 0x02 != 0 { raw |= 0x02 }   // NX_DEVICELSHIFTKEYMASK
-                if bit & 0x04 != 0 { raw |= 0x20 }   // NX_DEVICELALTKEYMASK
-                if bit & 0x08 != 0 { raw |= 0x08 }   // NX_DEVICELCMDKEYMASK
-                if bit & 0x10 != 0 { raw |= 0x2000 } // NX_DEVICERCTLKEYMASK
-                if bit & 0x20 != 0 { raw |= 0x04 }   // NX_DEVICERSHIFTKEYMASK
-                if bit & 0x40 != 0 { raw |= 0x40 }   // NX_DEVICERALTKEYMASK
-                if bit & 0x80 != 0 { raw |= 0x10 }   // NX_DEVICERCMDKEYMASK
-            }
-        }
-        return CGEventFlags(rawValue: raw)
+        InputCoordinator.hidSemanticFlags(from: modifiers)
     }
 
     private func eventFlags(_ semantic: CGEventFlags, flagsChanged: Bool = false) -> CGEventFlags {
-        let device = deviceModifierFlags()
-        var result = semantic.union(device)
+        let mergedSemantic = flagsChanged ? semantic : semantic.union(coordinator.mergedSemanticModifierFlags())
+        let device = coordinator.mergedDeviceModifierFlags()
+        var result = mergedSemantic.union(device)
         let modifierFlags: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskAlphaShift]
-        if flagsChanged || !device.isEmpty || !semantic.intersection(modifierFlags).isEmpty {
+        if flagsChanged || !device.isEmpty || !mergedSemantic.intersection(modifierFlags).isEmpty {
             result.insert(CGEventFlags(rawValue: 0x100)) // NX_NONCOALESCEDMASK
         }
         return result
@@ -443,8 +733,7 @@ final class RemoteInput {
 
     private func releaseFlags(for mapped: MappedKey, from before: CGEventFlags) -> CGEventFlags {
         guard !mapped.modifier.isEmpty else { return before }
-        if held.values.contains(where: { $0.modifier.contains(mapped.modifier) })
-            || !hidSemanticFlags(from: hidModifierBitmap()).intersection(mapped.modifier).isEmpty {
+        if !coordinator.mergedSemanticModifierFlags().intersection(mapped.modifier).isEmpty {
             return before.union(mapped.modifier)
         }
         return before.subtracting(mapped.modifier)
@@ -563,10 +852,10 @@ final class RemoteInput {
         event.location = point
         event.flags = eventFlags(flags)
         event.setIntegerValueField(.tabletProximityEventVendorID, value: 0x4C4F)
-        event.setIntegerValueField(.tabletProximityEventTabletID, value: 1)
+        event.setIntegerValueField(.tabletProximityEventTabletID, value: tabletDeviceID)
         event.setIntegerValueField(.tabletProximityEventPointerID, value: tabletPointerID)
         event.setIntegerValueField(.tabletProximityEventDeviceID, value: tabletDeviceID)
-        event.setIntegerValueField(.tabletProximityEventSystemTabletID, value: 1)
+        event.setIntegerValueField(.tabletProximityEventSystemTabletID, value: tabletDeviceID)
         event.setIntegerValueField(.tabletProximityEventVendorUniqueID, value: Int64(bitPattern: tabletUniqueID))
         event.setIntegerValueField(.tabletProximityEventCapabilityMask, value: Self.quartzCapabilityMask(from: tabletCaps))
         event.setIntegerValueField(.tabletProximityEventPointerType, value: tabletToolType)
@@ -1180,27 +1469,23 @@ final class RemoteInput {
             let before = KeyMapping.flags(modifiers, locks)
             if state == 0 {
                 if let releasedHid = heldHid.removeValue(forKey: identity) {
-                    if let vk = virtualKeyboard {
-                        if !sendHidState(for: releasedHid, via: vk) {
-                            heldHid.removeAll()
-                            vk.reset()
-                        }
-                    } else {
+                    if !coordinator.updateHid(sessionID: sessionID, heldHid: heldHid, changed: releasedHid) {
                         heldHid.removeAll()
                     }
                     let removedModFlags: CGEventFlags = {
                         if case .modifier(let bit) = releasedHid { return hidSemanticFlags(from: bit) }
                         return []
                     }()
-                    let activeMods = hidSemanticFlags(from: hidModifierBitmap())
-                        .union(held.values.reduce(CGEventFlags()) { $0.union($1.modifier) })
+                    let activeMods = coordinator.mergedSemanticModifierFlags()
                     flags = before.subtracting(removedModFlags).union(activeMods)
                     return
                 }
                 guard let mapped = held.removeValue(forKey: identity) else { return }
+                coordinator.setFallbackKeys(sessionID: sessionID, held: held)
                 flags = releaseFlags(for: mapped, from: before)
-                // Multiple physical keyboards may hold the same logical key.
-                if !held.values.contains(where: { $0.code == mapped.code && $0.text == mapped.text }) {
+                // Multiple physical keyboards or concurrent sessions may hold the same logical key.
+                let stillHeldLocally = held.values.contains(where: { $0.code == mapped.code && $0.text == mapped.text })
+                if !stillHeldLocally && !coordinator.otherSessionsHoldFallbackKey(mapped, excluding: sessionID) {
                     postKey(mapped, down: false, flags: flags)
                 }
             } else if state == 2 {
@@ -1209,17 +1494,21 @@ final class RemoteInput {
                     return
                 }
                 guard let mapped = held[identity], !KeyMapping.isModifier(mapped.code) else { return }
-                flags = before
-                postKey(mapped, down: true, flags: before.union(mapped.layoutFlags), repeatKey: true)
+                let mergedFlags = before.union(coordinator.mergedSemanticModifierFlags())
+                flags = mergedFlags
+                postKey(mapped, down: true, flags: mergedFlags.union(mapped.layoutFlags), repeatKey: true)
             } else {
                 if let prevHid = heldHid.removeValue(forKey: identity) {
-                    if let vk = virtualKeyboard, !sendHidState(for: prevHid, via: vk) {
+                    if !coordinator.updateHid(sessionID: sessionID, heldHid: heldHid, changed: prevHid) {
                         heldHid.removeAll()
-                        vk.reset()
                     }
                 }
                 if let prev = held.removeValue(forKey: identity) {
-                    postKey(prev, down: false, flags: releaseFlags(for: prev, from: before))
+                    coordinator.setFallbackKeys(sessionID: sessionID, held: held)
+                    if !held.values.contains(where: { $0.code == prev.code && $0.text == prev.text })
+                        && !coordinator.otherSessionsHoldFallbackKey(prev, excluding: sessionID) {
+                        postKey(prev, down: false, flags: releaseFlags(for: prev, from: before))
+                    }
                 }
                 guard held.count + heldHid.count < 128 else { throw SenderError("Too many held keys") }
                 let sym: UInt32
@@ -1228,11 +1517,10 @@ final class RemoteInput {
                 } else {
                     sym = UInt32(try Wire.integer(object, "keysym", 0...Int(UInt32.max)))
                 }
-                if let vk = virtualKeyboard, vk.isReady, let hid = KeyMap.hidKey(forEvdev: identity.code) {
+                if let vk = coordinator.backend, vk.isReady, let hid = KeyMap.hidKey(forEvdev: identity.code) {
                     heldHid[identity] = hid
-                    if sendHidState(for: hid, via: vk) {
-                        let activeMods = hidSemanticFlags(from: hidModifierBitmap())
-                            .union(held.values.reduce(CGEventFlags()) { $0.union($1.modifier) })
+                    if coordinator.updateHid(sessionID: sessionID, heldHid: heldHid, changed: hid) {
+                        let activeMods = coordinator.mergedSemanticModifierFlags()
                         if case .keyboard(0x39) = hid {
                             flags = before.symmetricDifference(.maskAlphaShift).union(activeMods)
                         } else {
@@ -1241,7 +1529,6 @@ final class RemoteInput {
                         return
                     }
                     heldHid.removeAll()
-                    vk.reset()
                 }
                 var mapped: MappedKey
                 if identity.code > 0, (sym != 0 || mapping == "physical"),
@@ -1262,12 +1549,14 @@ final class RemoteInput {
                     mapped.modifier = KeyMapping.modifierBit(sym)
                 }
                 held[identity] = mapped
-                flags = before.union(mapped.modifier)
+                coordinator.setFallbackKeys(sessionID: sessionID, held: held)
+                let mergedMods = coordinator.mergedSemanticModifierFlags()
+                flags = before.union(mergedMods)
                 if mapped.code == 57 { // Caps Lock toggles only on its press.
                     flags.formSymmetricDifference(.maskAlphaShift)
                     postKey(mapped, down: true, flags: flags)
                 } else {
-                    postKey(mapped, down: true, flags: mapped.flags.union(mapped.modifier))
+                    postKey(mapped, down: true, flags: mapped.flags.union(mergedMods))
                 }
             }
         case "pointer":
@@ -1315,9 +1604,10 @@ final class RemoteInput {
             let intDy = Int64(pointerDeltaRemY.rounded())
             pointerDeltaRemX -= Double(intDx)
             pointerDeltaRemY -= Double(intDy)
-            let button = buttons.contains(272) ? 272 : buttons.contains(273) ? 273 : 274
+            let globalButtons = coordinator.globalPressedButtons()
+            let button = globalButtons.contains(272) ? 272 : globalButtons.contains(273) ? 273 : 274
             let cgButton: CGMouseButton = button == 272 ? .left : button == 273 ? .right : .center
-            let eventType: CGEventType = buttons.isEmpty ? .mouseMoved : button == 272 ? .leftMouseDragged : button == 273 ? .rightMouseDragged : .otherMouseDragged
+            let eventType: CGEventType = globalButtons.isEmpty ? .mouseMoved : button == 272 ? .leftMouseDragged : button == 273 ? .rightMouseDragged : .otherMouseDragged
             if let event = CGEvent(mouseEventSource: source, mouseType: eventType, mouseCursorPosition: lastPoint, mouseButton: cgButton) {
                 event.setIntegerValueField(.mouseEventDeltaX, value: intDx)
                 event.setIntegerValueField(.mouseEventDeltaY, value: intDy)
@@ -1332,7 +1622,9 @@ final class RemoteInput {
             } else if live, let current = CGEvent(source: nil)?.location {
                 lastPoint = current
             }
-            if down ? buttons.insert(button).inserted : buttons.remove(button) != nil { mouse(button, down, at: lastPoint) }
+            if coordinator.setButton(button, down: down, sessionID: sessionID) {
+                mouse(button, down, at: lastPoint)
+            }
         case "tablet":
             try handleTablet(object)
         case "touch":
@@ -1440,16 +1732,24 @@ final class RemoteInput {
         tabletDistance = 0.0
         tabletRotation = 0.0
         flags = []
+        // Release only what this session holds. The coordinator resets the shared
+        // virtual keyboard when no other session still holds a key.
+        let hadHid = !heldHid.isEmpty
         heldHid.removeAll()
-        virtualKeyboard?.reset()
+        coordinator.clearHid(sessionID: sessionID, hadKeys: hadHid)
         let cancelledKeys = held
         held.removeAll()
+        coordinator.setFallbackKeys(sessionID: sessionID, held: [:])
+        let remainingMods = coordinator.mergedSemanticModifierFlags()
         var released = Set<CGKeyCode>()
         for mapped in cancelledKeys.values where released.insert(mapped.code).inserted {
-            postKey(mapped, down: false, flags: [])
+            if !coordinator.otherSessionsHoldKeyCode(mapped.code, excluding: sessionID) {
+                postKey(mapped, down: false, flags: remainingMods)
+            }
         }
-        for button in buttons { mouse(button, false, at: lastPoint, cancelled: true) }
-        buttons.removeAll()
+        for button in coordinator.clearButtons(sessionID: sessionID) {
+            mouse(button, false, at: lastPoint, cancelled: true)
+        }
         scrollX = 0; scrollY = 0
         pointerDeltaRemX = 0.0; pointerDeltaRemY = 0.0
     }

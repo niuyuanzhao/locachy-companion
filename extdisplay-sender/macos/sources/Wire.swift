@@ -80,16 +80,52 @@ struct Panel: Equatable {
     let deviceName: String
     let hostName: String
     let machineModel: String
+    let hostID: String?
+    let peerGrantIdentity: String?
+    let peerGrantCode: String?
 
     var streamCodec: String {
         codec.hasPrefix("hevc") ? "hevc" : "h264"
     }
 
+    // Keys DisplayModeDB. Deliberately independent of hostID so saved scaling
+    // choices from earlier releases keep matching after an upgrade.
     var identityKey: String {
         if !hostName.isEmpty || !machineModel.isEmpty {
             return "host=\(hostName)|model=\(machineModel)|panel=\(width)x\(height)"
         }
         return "device=\(deviceName)|panel=\(width)x\(height)"
+    }
+
+    var displayLabel: String {
+        let base = !hostName.isEmpty ? hostName : (deviceName != "LOCachy" ? deviceName : "")
+        return base.isEmpty ? "LOCachy" : "LOCachy (\(base))"
+    }
+
+    private static func sanitizeHostID(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let bytes = Array(raw.utf8)
+        guard bytes.count >= 8 && bytes.count <= 64 else { return nil }
+        let ok = bytes.allSatisfy { b in
+            (b >= 0x30 && b <= 0x39)
+                || (b >= 0x41 && b <= 0x5a)
+                || (b >= 0x61 && b <= 0x7a)
+                || b == 0x5f || b == 0x2d
+        }
+        return ok ? raw : nil
+    }
+
+    private static func sanitizePeerIdentity(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let bytes = Array(raw.utf8)
+        guard bytes.count <= 128 else { return nil }
+        let ok = bytes.allSatisfy { b in
+            (b >= 0x30 && b <= 0x39)
+                || (b >= 0x41 && b <= 0x5a)
+                || (b >= 0x61 && b <= 0x7a)
+                || b == 0x5f || b == 0x2d || b == 0x2e
+        }
+        return ok ? raw : nil
     }
 
     private static func sanitizeLabel(_ raw: String?) -> String {
@@ -109,7 +145,7 @@ struct Panel: Equatable {
         return out.trimmingCharacters(in: .whitespaces)
     }
 
-    init(hello: [String: Any]) throws {
+    init(hello: [String: Any], discoveredHostID: String? = nil) throws {
         guard hello["type"] as? String == "hello", try Wire.integer(hello, "locachy", 1...1) == 1,
               try Wire.integer(hello, "pv", 3...3) == 3,
               try Wire.boolean(hello, "extendedOnly"),
@@ -121,6 +157,17 @@ struct Panel: Equatable {
         deviceName = device.isEmpty ? "LOCachy" : device
         hostName = Self.sanitizeLabel(hello["host"] as? String)
         machineModel = Self.sanitizeLabel(hello["model"] as? String)
+        hostID = Self.sanitizeHostID(hello["hostId"] as? String ?? hello["hostid"] as? String)
+            ?? Self.sanitizeHostID(discoveredHostID)
+        let grantIdentity = Self.sanitizePeerIdentity(hello["peerIdentity"] as? String)
+        let grantCodeRaw = (hello["peerKey"] as? String) ?? (hello["peerCode"] as? String)
+        if let grantIdentity, let grantCodeRaw, !grantCodeRaw.isEmpty, grantCodeRaw.utf8.count <= 64 {
+            peerGrantIdentity = grantIdentity
+            peerGrantCode = grantCodeRaw
+        } else {
+            peerGrantIdentity = nil
+            peerGrantCode = nil
+        }
         let panel = hello["panel"] as? [String: Any] ?? hello
         width = try Wire.integer(panel, panel["width"] == nil ? "pixelsWide" : "width", 64...4096)
         height = try Wire.integer(panel, panel["height"] == nil ? "pixelsHigh" : "height", 64...4096)

@@ -113,7 +113,9 @@ TARGET="$(uname -m)-apple-macos13.0"
     "$ROOT/sources/UpstreamLog.swift" \
     "$ROOT/sources/Wire.swift" \
     "$ROOT/sources/DisplayModeDB.swift" \
+    "$ROOT/sources/DisplayIdentity.swift" \
     "$ROOT/sources/PairingCode.swift" \
+    "$ROOT/sources/PeerStore.swift" \
     "$ROOT/sources/SecureTransport.swift" \
     "$ROOT/sources/HidHelperProtocol.swift" \
     "$ROOT/sources/KeyMap.swift" \

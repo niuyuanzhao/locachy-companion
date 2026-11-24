@@ -23,7 +23,21 @@ brew services start locachy-macos-sender
 - 在 **系统设置 → 隐私与安全性** 中为 `LOCachy Extended Display` 授予 **屏幕录制** 与 **辅助功能** 权限。
 - 若安装了 `locachy-virtual-hid`，请在 **系统设置 → 登录项与扩展 → 驱动程序扩展**（或 **隐私与安全性**）中批准 **Karabiner-DriverKit-VirtualHIDDevice** 扩展。在批准生效前，键盘会自动无缝回退到物理键码 1:1 的 `CGEventPost` 模式。
 
-通过雷电／USB4 线缆、Hub、Dock 或菊花链连接并在 LOCachy 上打开 `extdisplay` 后，后台服务会自动发现接收器并建立连接。
+通过雷电／USB4 线缆、Hub、Dock 或菊花链连接并在一台或多台 LOCachy 上打开 `extdisplay` 后，后台服务会持续发现各个接收端并同时建立连接。
+
+## 多屏并行会话与持久配对
+
+- **多接收端同时在线**：在已有扩展屏串流时，雷电链路监听与 Bonjour 发现保持常开；新接入第二台、第三台 LOCachy 时会自动建立各自独立的虚拟显示器、采集通道与 VideoToolbox 硬件编码会话，不会打断现有屏幕。
+- **稳定的每设备虚拟显示器标识**：每个虚拟显示器按接收端的 `hostId`（无 `hostId` 时回退至 `host`、`model` 与面板尺寸）确定性推导非零 `serialNum`、`productID`（`0x4C00–0x4CFF`）以及显示名称（`LOCachy (<host>)`），并在进程内避免冲突，使 macOS 独立记住每台 LOCachy 的排列位置、分辨率、HiDPI 缩放与色彩配置。
+- **一次配对持久复用（`peers.json`）**：支持携带 `hostid=` 与 `paired=1`（可省去明文 `code=`）的新版广播，凭据以原子写入方式保存在 `~/Library/Application Support/LOCachy/peers.json`（目录 `0700`、文件 `0600`）；对仅广播临时配对码的旧版接收端保持 100% 向后兼容且不落盘临时码。
+  - 可在连接窗口点击 **Pair…** 粘贴 LOCachy 生成的配对口令，或通过命令行导入（命令行从标准输入读取口令，避免长期密钥出现在进程列表中）：
+    ```sh
+    printf '%s\n' 'locachy-pair://v1?host=<hostid>&id=<identity>&code=<CODE>&name=<label>' | locachy-macos-sender --pair-token -
+    locachy-macos-sender --list-peers
+    locachy-macos-sender --forget-peer <hostid>
+    ```
+  - 若某台已配对设备在 TLS 握手阶段拒绝旧凭据，该设备会立即停止自动重试并提示重新配对，不影响其它已连接屏幕。
+- **多会话统一输入协调**：进程内通过唯一的 `InputCoordinator` 共享同一个 `VirtualKeyboardClient`（与 `locachy-hid-helper` 的单客户端槽位匹配），在所有活动会话间求按键与修饰键并集、共享指针位置与鼠标按键引用计数，并为每个会话分配独立的 Quartz 数位板设备 ID；任一屏幕断开或发送取消指令时，不会误放另一台设备上仍在按住的修饰键或拖拽状态。
 
 ## 显示几何与输入转发
 

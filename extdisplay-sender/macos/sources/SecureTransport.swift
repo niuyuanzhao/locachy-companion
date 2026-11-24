@@ -73,11 +73,11 @@ final class SecureTransport {
     }
     var onReady: (() -> Void)?
     var onControl: (([String: Any]) -> Void)?
-    var onEnd: ((String) -> Void)?
+    var onEnd: ((String, Bool) -> Void)?
 
     // Shared by production and the loopback interoperability test, so the
     // tested TLS profile is exactly the one used on the dedicated cable.
-    static func tlsOptions(key: Data, queue: DispatchQueue) -> NWProtocolTLS.Options {
+    static func tlsOptions(key: Data, identity: String = Wire.identity, queue: DispatchQueue) -> NWProtocolTLS.Options {
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
         // TLS 1.2 PSK: the Apple client cannot complete external TLS 1.3 PSK
@@ -87,7 +87,7 @@ final class SecureTransport {
         sec_protocol_options_set_max_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_append_tls_ciphersuite(options, tls_ciphersuite_t(rawValue: Wire.pskSuite)!)
         sec_protocol_options_add_tls_application_protocol(options, Wire.alpn)
-        sec_protocol_options_add_pre_shared_key(options, dispatchBytes(key), dispatchBytes(Data(Wire.identity.utf8)))
+        sec_protocol_options_add_pre_shared_key(options, dispatchBytes(key), dispatchBytes(Data(identity.utf8)))
         sec_protocol_options_set_tls_tickets_enabled(options, false)
         sec_protocol_options_set_tls_resumption_enabled(options, false)
         // TLS 1.2 renegotiation defaults to enabled in Network.framework.
@@ -108,11 +108,11 @@ final class SecureTransport {
     // The cable profile: TLS above, Nagle off, bounded connect, and no path
     // other than the one named interface. Wi-Fi, cellular and loopback are
     // prohibited outright so a missing cable can never fall back to them.
-    static func cableParameters(key: Data, queue: DispatchQueue, interface: NWInterface) -> NWParameters {
+    static func cableParameters(key: Data, identity: String = Wire.identity, queue: DispatchQueue, interface: NWInterface) -> NWParameters {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.connectionTimeout = 8
-        let parameters = NWParameters(tls: tlsOptions(key: key, queue: queue), tcp: tcp)
+        let parameters = NWParameters(tls: tlsOptions(key: key, identity: identity, queue: queue), tcp: tcp)
         parameters.prohibitedInterfaceTypes = [.wifi, .cellular, .loopback]
         parameters.prohibitExpensivePaths = true
         parameters.allowLocalEndpointReuse = false
@@ -135,10 +135,11 @@ final class SecureTransport {
         return selected
     }
 
-    init(endpoint: CableEndpoint, key: Data) throws {
+    init(endpoint: CableEndpoint, key: Data, identity: String = Wire.identity) throws {
         guard key.count == PairingCode.bytes else { throw SenderError("Pairing code must be 16 bytes") }
+        guard !identity.isEmpty, identity.utf8.count <= 128 else { throw SenderError("Invalid PSK identity") }
         let selected = try Self.scopedInterface(for: endpoint)
-        let parameters = Self.cableParameters(key: key, queue: queue, interface: selected)
+        let parameters = Self.cableParameters(key: key, identity: identity, queue: queue, interface: selected)
         connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: parameters)
     }
 
@@ -149,13 +150,20 @@ final class SecureTransport {
                 guard let self, !self.ended else { return }
                 switch state {
                 case .ready:
-                    guard Self.profileOK(connection) else { self.finish("TLS profile negotiation failed"); return }
+                    guard Self.profileOK(connection) else { self.finish("TLS profile negotiation failed", authFailed: true); return }
                     self.ready = true
                     self.lastReceived = ProcessInfo.processInfo.systemUptime
                     self.onReady?()
                     self.receive()
                 case .waiting(let error), .failed(let error):
-                    self.finish("Thunderbolt connection or pairing failed: \(error). Check the cable, current receiver code and Local Network permission")
+                    let isTLSAuthFailure: Bool
+                    if case .tls = error {
+                        isTLSAuthFailure = !self.ready
+                    } else {
+                        isTLSAuthFailure = false
+                    }
+                    self.finish("Thunderbolt connection or pairing failed: \(error). Check the cable, current receiver code and Local Network permission",
+                                authFailed: isTLSAuthFailure)
                 case .cancelled:
                     self.finish("Connection closed")
                 default: break
@@ -262,13 +270,13 @@ final class SecureTransport {
         return true
     }
     func stop(_ reason: String) { queue.async { self.finish(reason) } }
-    private func finish(_ reason: String) {
+    private func finish(_ reason: String, authFailed: Bool = false) {
         guard !ended else { return }
         ended = true
         ready = false
         timer?.cancel(); timer = nil
         connection?.stateUpdateHandler = nil
         connection?.cancel(); connection = nil
-        onEnd?(reason)
+        onEnd?(reason, authFailed)
     }
 }

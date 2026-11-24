@@ -52,6 +52,7 @@ enum ProtocolTests {
         modifierTransitionTests()
         physicalAndVirtualHidTests()
         tabletAndTouchTests()
+        multiSessionTests()
         if failures == 0 {
             print("PASS: all protocol tests")
             exit(0)
@@ -736,6 +737,99 @@ final class FakeVirtualKeyboard: VirtualKeyboardBackend {
                   "cancel resets sub-pixel pointer delta residuals")
         } catch {
             check(false, "sub-pixel pointer residual accumulation: \(error)")
+        }
+    }
+
+    // Multi-session coordination: one shared virtual keyboard with union HID
+    // state, per-session cancel isolation, shared pointer and button refcounts.
+    static func multiSessionTests() {
+        let bounds = { CGRect(x: 0, y: 0, width: 1920, height: 1200) }
+
+        // 1. HID union. A holds Shift, B holds 'a' and cancels: Shift stays in
+        // the shared report and nothing resets. A's cancel releases it and resets.
+        do {
+            let fakeHid = FakeVirtualKeyboard(ready: true)
+            let coordinator = InputCoordinator(live: false, virtualKeyboard: fakeHid)
+            let recA = Recorder(), recB = Recorder()
+            let inputA = RemoteInput(bounds: bounds, sink: { recA.posted.append($0) }, coordinator: coordinator)
+            let inputB = RemoteInput(bounds: bounds, sink: { recB.posted.append($0) }, coordinator: coordinator)
+            do {
+                try inputA.handle(["type": "key", "device": 1, "code": 42, "keysym": 0xffe1,
+                                   "modifiers": 0, "locks": 0, "state": 1, "mapping": "logical"])
+                try inputB.handle(["type": "key", "device": 2, "code": 30, "keysym": 0x61,
+                                   "modifiers": 0, "locks": 0, "state": 1, "mapping": "logical"])
+                check(fakeHid.keyboardReports.last?.0 == 0x02 && fakeHid.keyboardReports.last?.1 == [0x04],
+                      "two sessions share one keyboard report: A's Shift with B's key")
+                try inputB.handle(["type": "cancel", "scope": "all"])
+                check(fakeHid.keyboardReports.last?.0 == 0x02 && fakeHid.keyboardReports.last?.1 == [] && fakeHid.resets == 0,
+                      "session B cancel keeps session A's Shift held and does not reset the virtual keyboard")
+                try inputA.handle(["type": "cancel", "scope": "all"])
+                check(fakeHid.resets == 1, "the last session to release resets the virtual keyboard once")
+            } catch {
+                check(false, "multi-session HID union: \(error)")
+            }
+        }
+
+        // 2. Fallback keys. Both sessions hold the same physical key. A's cancel
+        // must not post a key-up while B still holds it; B's release then does.
+        do {
+            let coordinator = InputCoordinator(live: false, virtualKeyboard: nil)
+            let recA = Recorder(), recB = Recorder()
+            let inputA = RemoteInput(bounds: bounds, sink: { recA.posted.append($0) }, coordinator: coordinator)
+            let inputB = RemoteInput(bounds: bounds, sink: { recB.posted.append($0) }, coordinator: coordinator)
+            do {
+                try inputA.handle(["type": "key", "device": 1, "code": 30, "keysym": 0,
+                                   "modifiers": 0, "locks": 0, "state": 1, "mapping": "physical"])
+                try inputB.handle(["type": "key", "device": 2, "code": 30, "keysym": 0,
+                                   "modifiers": 0, "locks": 0, "state": 1, "mapping": "physical"])
+                let postedBeforeCancel = recA.posted.count
+                try inputA.handle(["type": "cancel", "scope": "all"])
+                check(recA.posted.count == postedBeforeCancel && !recA.posted.contains(where: { $0.type == .keyUp }),
+                      "session A cancel does not release a key that session B still holds")
+                try inputB.handle(["type": "key", "device": 2, "code": 30, "keysym": 0,
+                                   "modifiers": 0, "locks": 0, "state": 0, "mapping": "physical"])
+                check(recB.posted.last?.type == .keyUp && recB.posted.last?.getIntegerValueField(.keyboardEventKeycode) == 0,
+                      "session B releases the shared key once no other session holds it")
+            } catch {
+                check(false, "multi-session fallback keys: \(error)")
+            }
+        }
+
+        // 3. Shared pointer and buttons. One press for the button and one release
+        // at the end. Session B's motion while A holds the button drags it.
+        do {
+            let coordinator = InputCoordinator(live: false, virtualKeyboard: nil)
+            let recA = Recorder(), recB = Recorder()
+            let inputA = RemoteInput(bounds: bounds, sink: { recA.posted.append($0) }, coordinator: coordinator)
+            let inputB = RemoteInput(bounds: bounds, sink: { recB.posted.append($0) }, coordinator: coordinator)
+            do {
+                try inputA.handle(["type": "pointer", "x": 0.5, "y": 0.5])
+                try inputA.handle(["type": "button", "button": 272, "state": 1, "x": 0.5, "y": 0.5])
+                try inputB.handle(["type": "button", "button": 272, "state": 1, "x": 0.5, "y": 0.5])
+                let allPosted = recA.posted + recB.posted
+                check(allPosted.filter { $0.type == .leftMouseDown }.count == 1,
+                      "a button pressed by two sessions produces a single mouse-down")
+                try inputB.handle(["type": "pointer", "x": 0.5, "y": 0.5, "dx": 10, "dy": 0])
+                check(recB.posted.last?.type == .leftMouseDragged,
+                      "motion from session B drags the button held by session A")
+                try inputA.handle(["type": "button", "button": 272, "state": 0, "x": 0.5, "y": 0.5])
+                let upsAfterA = (recA.posted + recB.posted).filter { $0.type == .leftMouseUp }.count
+                try inputB.handle(["type": "button", "button": 272, "state": 0, "x": 0.5, "y": 0.5])
+                let upsAfterB = (recA.posted + recB.posted).filter { $0.type == .leftMouseUp }.count
+                check(upsAfterA == 0 && upsAfterB == 1,
+                      "the mouse button is released only when the last session lets go")
+            } catch {
+                check(false, "shared pointer and button refcounts: \(error)")
+            }
+        }
+
+        // 4. Each concurrent session owns a distinct Quartz tablet device ID.
+        do {
+            let coordinator = InputCoordinator(live: false, virtualKeyboard: nil)
+            let first = RemoteInput(bounds: bounds, sink: { _ in }, coordinator: coordinator)
+            let second = RemoteInput(bounds: bounds, sink: { _ in }, coordinator: coordinator)
+            check(first.tabletDeviceID != second.tabletDeviceID,
+                  "concurrent sessions receive distinct tablet device IDs")
         }
     }
 }

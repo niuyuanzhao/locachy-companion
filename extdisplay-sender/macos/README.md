@@ -23,7 +23,21 @@ On the first run:
 - Grant **Screen Recording** and **Accessibility** to `LOCachy Extended Display` in **System Settings → Privacy & Security**.
 - When `locachy-virtual-hid` is installed, approve the **Karabiner-DriverKit-VirtualHIDDevice** driver extension in **System Settings → Login Items & Extensions → Driver Extensions** (or **Privacy & Security**). Until approved, keyboard input automatically falls back to physical 1:1 `CGEventPost` without interruption.
 
-When `extdisplay` is opened on LOCachy over a Thunderbolt/USB4 cable, hub, dock, or daisy chain, the background service discovers the receiver over the link and connects automatically.
+When `extdisplay` is opened on one or more LOCachy machines over Thunderbolt/USB4 cables, hubs, docks, or daisy chains, the background service discovers each receiver continuously and connects them simultaneously.
+
+## Multi-Display Sessions and Persistent Pairing
+
+- **Simultaneous receivers**: Discovery stays active while displays are streaming, so plugging in a second or third LOCachy receiver brings up its own independent virtual display, capture stream, and VideoToolbox encoder without interrupting existing displays.
+- **Stable per-receiver display identity**: Each virtual display derives a deterministic non-zero `serialNum`, `productID` (`0x4C00–0x4CFF`), and display name (`LOCachy (<host>)`) from the receiver's `hostId` (or `host`, `model`, and panel size) with in-process collision avoidance. macOS WindowServer remembers each receiver's arrangement, resolution, HiDPI scaling, and color profile independently across reconnects.
+- **Once-forever pairing (`peers.json`)**: Receivers advertising `hostid=` and `paired=1` (with or without an ephemeral `code=`) match stored credentials in `~/Library/Application Support/LOCachy/peers.json` (mode `0600` in a `0700` directory, updated atomically). Legacy ephemeral-code receivers continue to connect automatically without storing secrets.
+  - Import a pairing token from LOCachy via the GUI **Pair…** button or the CLI. The CLI reads the token from stdin so the long-lived secret never appears in the process list:
+    ```sh
+    printf '%s\n' 'locachy-pair://v1?host=<hostid>&id=<identity>&code=<CODE>&name=<label>' | locachy-macos-sender --pair-token -
+    locachy-macos-sender --list-peers
+    locachy-macos-sender --forget-peer <hostid>
+    ```
+  - If a receiver rejects a stored credential at TLS handshake time, automatic retries stop for that receiver and the window prompts you to re-pair instead of looping.
+- **Coordinated multi-session input**: A single process-wide `InputCoordinator` owns the one `VirtualKeyboardClient` connection to `locachy-hid-helper`, merges held HID and fallback keys/modifiers across all active sessions, refcounts mouse buttons and shares cursor position across sessions, and assigns each session a distinct Quartz tablet device ID so cancelling or disconnecting one display never drops keys or drags held on another.
 
 ## Display Geometry and Input
 

@@ -9,20 +9,57 @@ struct ReceiverChoice: Equatable {
     let link: CableLink
     let address: String
     let port: UInt16
-    let code: String
+    let code: String?
+    let hostID: String?
+    let paired: Bool
+
+    init(id: String, name: String, link: CableLink, address: String, port: UInt16,
+         code: String?, hostID: String? = nil, paired: Bool = false) {
+        self.id = id
+        self.name = name
+        self.link = link
+        self.address = address
+        self.port = port
+        self.code = code
+        self.hostID = hostID
+        self.paired = paired
+    }
+
+    var pairedOnly: Bool { paired && code == nil }
+    var peerKey: String { hostID ?? name }
+}
+
+struct DiscoveryAdvertisement: Equatable {
+    let code: String?
+    let hostID: String?
+    let paired: Bool
+
+    var pairedOnly: Bool { paired && code == nil }
 }
 
 enum DiscoveryProfile {
     static let type = "_locachy-ext._tcp"
     static let domain = "local."
     static let port: UInt16 = 27183
+    private static let allowedTXTKeys: Set<String> = ["pv", "extended", "pair", "code", "hostid", "paired"]
 
     static func validName(_ name: String) -> Bool {
         !name.isEmpty && name.utf8.count <= 63
             && name.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7f }
     }
 
-    static func parseTXT(_ data: Data) -> String? {
+    static func validHostID(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard bytes.count >= 8 && bytes.count <= 64 else { return false }
+        return bytes.allSatisfy { b in
+            (b >= 0x30 && b <= 0x39)
+                || (b >= 0x41 && b <= 0x5a)
+                || (b >= 0x61 && b <= 0x7a)
+                || b == 0x5f || b == 0x2d
+        }
+    }
+
+    static func parseTXT(_ data: Data) -> DiscoveryAdvertisement? {
         guard !data.isEmpty, data.count <= 512 else { return nil }
         let bytes = Array(data)
         var offset = 0, fields: [String: String] = [:]
@@ -36,12 +73,42 @@ enum DiscoveryProfile {
             guard pair.count == 2, fields[String(pair[0]).lowercased()] == nil else { return nil }
             fields[String(pair[0]).lowercased()] = String(pair[1])
         }
-        guard Set(fields.keys) == Set(["pv", "extended", "pair", "code"]),
-              fields["pv"] == "3", fields["extended"] == "1", fields["pair"] == "psk128",
-              let code = fields["code"] else { return nil }
-        let raw = Array(code.utf8)
-        guard (try? raw.withUnsafeBufferPointer { try PairingCode.decode($0) }) != nil else { return nil }
-        return code
+        guard Set(fields.keys).isSubset(of: allowedTXTKeys),
+              fields["pv"] == "3", fields["extended"] == "1", fields["pair"] == "psk128" else {
+            return nil
+        }
+
+        let hostID: String?
+        if let rawHostID = fields["hostid"] {
+            guard validHostID(rawHostID) else { return nil }
+            hostID = rawHostID
+        } else {
+            hostID = nil
+        }
+
+        let paired: Bool
+        if let rawPaired = fields["paired"] {
+            guard rawPaired == "0" || rawPaired == "1" else { return nil }
+            paired = rawPaired == "1"
+        } else {
+            paired = false
+        }
+
+        let code: String?
+        if let rawCode = fields["code"] {
+            var raw = Array(rawCode.utf8)
+            defer { PairingCode.zero(&raw) }
+            guard var decoded = try? raw.withUnsafeBufferPointer({ try PairingCode.decode($0) }) else {
+                return nil
+            }
+            decoded.resetBytes(in: 0..<decoded.count)
+            code = rawCode
+        } else {
+            code = nil
+        }
+
+        guard code != nil || (paired && hostID != nil) else { return nil }
+        return DiscoveryAdvertisement(code: code, hostID: hostID, paired: paired)
     }
 
     static func validTXT(_ data: Data) -> Bool { parseTXT(data) != nil }
@@ -162,7 +229,7 @@ private final class DiscoveredService {
     private var timeout: DispatchWorkItem?
     private var expiry: DispatchWorkItem?
     private var host = ""
-    private var code = ""
+    private var advertisement: DiscoveryAdvertisement?
 
     init(link: CableLink, name: String) { self.link = link; self.name = name }
     func start() {
@@ -184,18 +251,20 @@ private final class DiscoveredService {
     }
 
     private func resolved(target: String, port: UInt16, txt: Data) {
-        guard port == DiscoveryProfile.port, let code = DiscoveryProfile.parseTXT(txt), target.utf8.count <= 253,
+        guard port == DiscoveryProfile.port, let adv = DiscoveryProfile.parseTXT(txt), target.utf8.count <= 253,
               target.lowercased().hasSuffix(".local."), !target.contains("%"),
               target.utf8.allSatisfy({ $0 >= 0x20 && $0 != 0x7f }) else {
             if let addresses = addresses { DNSServiceRefDeallocate(addresses) }; addresses = nil
-            host = ""; self.code = ""; choice = nil; expiry?.cancel(); onChange?()
+            host = ""; advertisement = nil; choice = nil; expiry?.cancel(); onChange?()
             return
         }
-        self.code = code
+        advertisement = adv
         if host == target {
-            if let existing = choice, existing.code != code {
+            if let existing = choice,
+               existing.code != adv.code || existing.hostID != adv.hostID || existing.paired != adv.paired {
                 choice = ReceiverChoice(id: existing.id, name: existing.name, link: existing.link,
-                                        address: existing.address, port: existing.port, code: code)
+                                        address: existing.address, port: existing.port,
+                                        code: adv.code, hostID: adv.hostID, paired: adv.paired)
                 onChange?()
             }
             return
@@ -224,10 +293,12 @@ private final class DiscoveredService {
             if choice?.address == text { choice = nil; expiry?.cancel(); onChange?() }
             return
         }
+        guard let adv = advertisement else { return }
         // One advertised IPv6 address per service is enough; bounded state.
         guard choice == nil || choice?.address == text else { return }
         timeout?.cancel(); timeout = nil
-        choice = ReceiverChoice(id: "\(link.index)/\(name)", name: name, link: link, address: text, port: DiscoveryProfile.port, code: code)
+        choice = ReceiverChoice(id: "\(link.index)/\(name)", name: name, link: link, address: text,
+                                port: DiscoveryProfile.port, code: adv.code, hostID: adv.hostID, paired: adv.paired)
         expiry?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.choice = nil; self?.onChange?() }
         expiry = work
