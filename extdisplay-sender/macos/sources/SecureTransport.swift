@@ -48,7 +48,10 @@ final class SecureTransport {
     private let sendLock = NSLock()
     private var reader = FrameReader()
     private var timer: DispatchSourceTimer?
+    private var unviableDeadline: DispatchWorkItem?
+    private var startedAt = ProcessInfo.processInfo.systemUptime
     private var lastReceived = ProcessInfo.processInfo.systemUptime
+    private var lastPingSent = 0.0
     private var ready = false
     private var ended = false
     private var queuedVideo = 0
@@ -112,12 +115,33 @@ final class SecureTransport {
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         tcp.connectionTimeout = 8
+        tcp.connectionDropTime = 8
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 2
+        tcp.keepaliveInterval = 1
+        tcp.keepaliveCount = 3
         let parameters = NWParameters(tls: tlsOptions(key: key, identity: identity, queue: queue), tcp: tcp)
         parameters.prohibitedInterfaceTypes = [.wifi, .cellular, .loopback]
         parameters.prohibitExpensivePaths = true
         parameters.allowLocalEndpointReuse = false
         parameters.requiredInterface = interface
         return parameters
+    }
+
+    // Distinguishes genuine TLS handshake / PSK authentication rejections from
+    // transport-level link drops (e.g. cable unplug mid-handshake producing
+    // errSSLTransportReset, errSSLClosedAbort, errSSLNetworkTimeout).
+    // Pre-ready TLS errors keep their original meaning (PSK or profile rejection)
+    // except transport-level codes, which mean the cable or path went away.
+    static func isAuthFailure(tlsStatus: OSStatus) -> Bool {
+        switch tlsStatus {
+        case errSSLTransportReset, errSSLNetworkTimeout, errSSLClosedAbort,
+             errSSLClosedGraceful, errSSLClosedNoNotify, errSSLConnectionRefused,
+             errSSLWouldBlock:
+            return false
+        default:
+            return true
+        }
     }
 
     // NWPathMonitor.availableInterfaces omits link-local-only Thunderbolt
@@ -146,24 +170,47 @@ final class SecureTransport {
     func start() {
         queue.async { [weak self] in
             guard let self, let connection = self.connection else { return }
+            self.startedAt = ProcessInfo.processInfo.systemUptime
+            self.lastReceived = self.startedAt
+            self.lastPingSent = self.startedAt
+            connection.viabilityUpdateHandler = { [weak self] isViable in
+                guard let self, !self.ended, self.ready else { return }
+                if isViable {
+                    self.unviableDeadline?.cancel()
+                    self.unviableDeadline = nil
+                    return
+                }
+                // Path became unviable (e.g. Thunderbolt cable unplugged). Probe
+                // immediately and fail promptly if viability does not recover.
+                self.sendObject(["type": "ping"])
+                guard self.unviableDeadline == nil else { return }
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, !self.ended else { return }
+                    self.finish("Cable link lost (path unviable)", force: true)
+                }
+                self.unviableDeadline = work
+                self.queue.asyncAfter(deadline: .now() + 1.5, execute: work)
+            }
             connection.stateUpdateHandler = { [weak self] state in
                 guard let self, !self.ended else { return }
                 switch state {
                 case .ready:
-                    guard Self.profileOK(connection) else { self.finish("TLS profile negotiation failed", authFailed: true); return }
+                    guard Self.profileOK(connection) else { self.finish("TLS profile negotiation failed", authFailed: true, force: true); return }
                     self.ready = true
-                    self.lastReceived = ProcessInfo.processInfo.systemUptime
+                    let now = ProcessInfo.processInfo.systemUptime
+                    self.lastReceived = now
+                    self.lastPingSent = now
                     self.onReady?()
                     self.receive()
                 case .waiting(let error), .failed(let error):
                     let isTLSAuthFailure: Bool
-                    if case .tls = error {
-                        isTLSAuthFailure = !self.ready
+                    if case .tls(let status) = error, !self.ready {
+                        isTLSAuthFailure = Self.isAuthFailure(tlsStatus: status)
                     } else {
                         isTLSAuthFailure = false
                     }
                     self.finish("Thunderbolt connection or pairing failed: \(error). Check the cable, current receiver code and Local Network permission",
-                                authFailed: isTLSAuthFailure)
+                                authFailed: isTLSAuthFailure, force: true)
                 case .cancelled:
                     self.finish("Connection closed")
                 default: break
@@ -171,15 +218,25 @@ final class SecureTransport {
             }
             connection.start(queue: self.queue)
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now() + 2, repeating: 2)
+            timer.schedule(deadline: .now() + 1, repeating: 1)
             timer.setEventHandler { [weak self] in
-                guard let self, !self.ended, self.ready else { return }
-                let age = ProcessInfo.processInfo.systemUptime - self.lastReceived
-                guard age < 8 else {
-                    self.finish(String(format: "Cable session timed out (no peer data for %.1fs)", age))
+                guard let self, !self.ended else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                if !self.ready {
+                    if now - self.startedAt >= 10 {
+                        self.finish(String(format: "Cable handshake timed out (%.1fs)", now - self.startedAt), force: true)
+                    }
                     return
                 }
-                self.sendObject(["type": "ping"])
+                let age = now - self.lastReceived
+                guard age < 6 else {
+                    self.finish(String(format: "Cable session timed out (no peer data for %.1fs)", age), force: true)
+                    return
+                }
+                if now - self.lastPingSent >= 2 {
+                    self.lastPingSent = now
+                    self.sendObject(["type": "ping"])
+                }
             }
             self.timer = timer
             timer.resume()
@@ -202,17 +259,19 @@ final class SecureTransport {
             do {
                 if let data, !data.isEmpty {
                     self.lastReceived = ProcessInfo.processInfo.systemUptime
+                    self.unviableDeadline?.cancel()
+                    self.unviableDeadline = nil
                     try self.reader.feed(data) { payload in self.onControl?(try Wire.object(payload)) }
                 }
                 if let error {
-                    self.finish("Cable disconnected (\(error))")
+                    self.finish("Cable disconnected (\(error))", force: true)
                 } else if complete {
                     try self.reader.finish()
                     self.finish("Cable disconnected (peer closed)")
                 } else {
                     self.receive()
                 }
-            } catch { self.finish("Invalid control stream") }
+            } catch { self.finish("Invalid control stream", force: true) }
         }
     }
     func sendObject(_ object: [String: Any]) {
@@ -261,7 +320,7 @@ final class SecureTransport {
                 }
                 self.sendLock.unlock()
                 if let error {
-                    self.finish("Cable send failed (\(error))")
+                    self.finish("Cable send failed (\(error))", force: true)
                 } else {
                     drainHandler?()
                 }
@@ -270,13 +329,20 @@ final class SecureTransport {
         return true
     }
     func stop(_ reason: String) { queue.async { self.finish(reason) } }
-    private func finish(_ reason: String, authFailed: Bool = false) {
+    private func finish(_ reason: String, authFailed: Bool = false, force: Bool = false) {
         guard !ended else { return }
         ended = true
         ready = false
+        unviableDeadline?.cancel(); unviableDeadline = nil
         timer?.cancel(); timer = nil
+        connection?.viabilityUpdateHandler = nil
         connection?.stateUpdateHandler = nil
-        connection?.cancel(); connection = nil
+        if force {
+            connection?.forceCancel()
+        } else {
+            connection?.cancel()
+        }
+        connection = nil
         onEnd?(reason, authFailed)
     }
 }

@@ -6,7 +6,7 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT=${1:-/tmp/locachy-macos-sender-build}
 mkdir -p "$OUT/tests"
 
-"$HERE/build.sh" "$OUT"
+LOCACHY_SIGN_DIR="$OUT/signing" LOCACHY_SIGN_EPHEMERAL=1 "$HERE/build.sh" "$OUT"
 
 rm -f "$OUT/tests/protocol-tests"
 xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
@@ -26,9 +26,9 @@ xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos
 "$OUT/tests/hid-tests"
 
 xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
-    -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework IOKit -framework Network \
+    -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework IOKit -framework Network -framework Security \
     "$HERE/sources/Wire.swift" "$HERE/sources/PairingCode.swift" "$HERE/sources/PeerStore.swift" \
-    "$HERE/sources/LinkInterfaces.swift" "$HERE/sources/Discovery.swift" \
+    "$HERE/sources/SecureTransport.swift" "$HERE/sources/LinkInterfaces.swift" "$HERE/sources/Discovery.swift" \
     "$HERE/tests/ConnectionTests.swift" -o "$OUT/tests/connection-tests"
 "$OUT/tests/connection-tests"
 

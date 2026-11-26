@@ -61,7 +61,9 @@ struct Options {
 
 @available(macOS 14.0, *)
 final class Sender {
-    private static let inputTypes: Set<String> = ["key", "pointer", "button", "scroll", "cancel", "touch", "tablet"]
+    private static let inputTypes: Set<String> = [
+        "key", "pointer", "button", "scroll", "cancel", "touch", "tablet", "capsLockToggle", "capsLockState"
+    ]
     private let transport: SecureTransport
     private let inputCoordinator: InputCoordinator
     private let discoveredHostID: String?
@@ -197,13 +199,16 @@ final class Sender {
         } catch { finish(String(describing: error), code: 1) }
     }
 
-    func stop() { finish("Stopped by the Mac", code: 0) }
+    func stop(_ reason: String = "Stopped by the Mac") { finish(reason, code: 0) }
     private func finish(_ reason: String, code: Int32, authFailed: Bool = false) {
         guard !finished else { return }
         finished = true
         captureLock.lock()
         inputCapture = nil
         captureLock.unlock()
+        // Close the transport immediately so a dead or superseded cable link
+        // stops waiting on peer I/O while CaptureSession finishes teardown.
+        transport.stop(reason)
         let pendingStart = startTask
         pendingStart?.cancel(); startTask = nil
         Task { @MainActor in
@@ -215,7 +220,6 @@ final class Sender {
             } else {
                 SenderLog.info(reason)
             }
-            self.transport.stop(reason)
             // The same cleanup serves both GUI retry and the one-shot CLI.
             try? await Task.sleep(for: .milliseconds(250))
             self.onEnd?(reason, code, authFailed)

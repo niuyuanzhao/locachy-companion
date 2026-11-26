@@ -1,7 +1,102 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import Carbon
+import IOKit
+import IOKit.hidsystem
 import IOKit.pwr_mgt
+
+protocol CapsLockAuthority: AnyObject {
+    func currentState() -> Bool?
+    func setState(_ on: Bool) -> Bool
+    func waitUntilConfirmed(_ desired: Bool) -> Bool
+}
+
+// Single authoritative macOS Caps Lock bridge backed by IOHIDSystem.
+// IOHIDSetModifierLockState updates all keyboard services (including physical
+// LEDs) asynchronously; waitUntilConfirmed polls the real HID state briefly
+// inside InputCoordinator.queue so subsequent remote keys stay ordered behind
+// a requested Caps Lock change without injecting a duplicate synthetic key.
+final class SystemCapsLockAuthority: CapsLockAuthority {
+    private let lock = NSLock()
+    private var connect: io_connect_t = 0
+    private let confirmTimeoutSeconds: TimeInterval = 0.08
+    private let confirmPollMicroseconds: useconds_t = 2_000
+
+    deinit {
+        closeConnection()
+    }
+
+    private func openConnectionLocked() -> io_connect_t {
+        if connect != 0 { return connect }
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        guard service != 0 else { return 0 }
+        defer { IOObjectRelease(service) }
+        var handle: io_connect_t = 0
+        guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &handle) == KERN_SUCCESS,
+              handle != 0 else { return 0 }
+        connect = handle
+        return handle
+    }
+
+    private func closeConnectionLocked() {
+        if connect != 0 {
+            IOServiceClose(connect)
+            connect = 0
+        }
+    }
+
+    private func closeConnection() {
+        lock.lock()
+        closeConnectionLocked()
+        lock.unlock()
+    }
+
+    private func readHIDStateLocked() -> Bool? {
+        for _ in 0..<2 {
+            let handle = openConnectionLocked()
+            guard handle != 0 else { return nil }
+            var state = false
+            let kr = IOHIDGetModifierLockState(handle, Int32(kIOHIDCapsLockState), &state)
+            if kr == KERN_SUCCESS { return state }
+            closeConnectionLocked()
+        }
+        return nil
+    }
+
+    func currentState() -> Bool? {
+        lock.lock()
+        let hidState = readHIDStateLocked()
+        lock.unlock()
+        if let hidState { return hidState }
+        return CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift)
+    }
+
+    func setState(_ on: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        for _ in 0..<2 {
+            let handle = openConnectionLocked()
+            guard handle != 0 else { return false }
+            let kr = IOHIDSetModifierLockState(handle, Int32(kIOHIDCapsLockState), on)
+            if kr == KERN_SUCCESS { return true }
+            closeConnectionLocked()
+        }
+        return false
+    }
+
+    func waitUntilConfirmed(_ desired: Bool) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + confirmTimeoutSeconds
+        while true {
+            let hid = currentState()
+            let cg = CGEventSource.flagsState(.hidSystemState).contains(.maskAlphaShift)
+            if hid == desired && cg == desired { return true }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                return hid == desired
+            }
+            usleep(confirmPollMicroseconds)
+        }
+    }
+}
 
 struct KeyIdentity: Hashable { let device: Int; let code: Int }
 // flags: flags for the initial press; layoutFlags: only the Shift/Option
@@ -161,6 +256,11 @@ final class InputCoordinator {
     private let live: Bool
     private var virtualKeyboard: VirtualKeyboardBackend?
     private var ownsVirtualKeyboard: Bool
+    private let capsAuthority: CapsLockAuthority?
+    private var capsSubscribers: [UInt64: (Bool) -> Void] = [:]
+    private var capsPollTimer: DispatchSourceTimer?
+    private var capsPollIntervalNs: UInt64 = 100_000_000
+    private var lastPublishedCaps: Bool?
     private var nextSessionID: UInt64 = 0
     private var nextTabletDeviceID: Int64 = 0
     private var activeSessions = Set<UInt64>()
@@ -171,10 +271,14 @@ final class InputCoordinator {
     private var sharedHasLastPoint = false
     private var sharedLastPointerTime = 0.0
 
-    init(live: Bool = false, virtualKeyboard: VirtualKeyboardBackend? = nil) {
+    init(live: Bool = false,
+         virtualKeyboard: VirtualKeyboardBackend? = nil,
+         capsAuthority: CapsLockAuthority? = nil) {
         self.live = live
         self.virtualKeyboard = virtualKeyboard
         self.ownsVirtualKeyboard = live && virtualKeyboard == nil
+        let automatic: CapsLockAuthority? = live ? SystemCapsLockAuthority() : nil
+        self.capsAuthority = capsAuthority ?? automatic
     }
 
     var backend: VirtualKeyboardBackend? {
@@ -211,7 +315,10 @@ final class InputCoordinator {
         sessionHid.removeValue(forKey: sessionID)
         sessionFallbackKeys.removeValue(forKey: sessionID)
         sessionButtons.removeValue(forKey: sessionID)
+        capsSubscribers.removeValue(forKey: sessionID)
+        if capsSubscribers.isEmpty { lastPublishedCaps = nil }
         lock.unlock()
+        scheduleCapsPollUpdate()
     }
 
     func shutdown() {
@@ -219,11 +326,120 @@ final class InputCoordinator {
         sessionHid.removeAll()
         sessionFallbackKeys.removeAll()
         sessionButtons.removeAll()
+        capsSubscribers.removeAll()
+        lastPublishedCaps = nil
         let owned = ownsVirtualKeyboard ? virtualKeyboard : nil
         if ownsVirtualKeyboard { virtualKeyboard = nil }
         lock.unlock()
+        scheduleCapsPollUpdate()
         owned?.reset()
         owned?.stop()
+    }
+
+    // MARK: - Authoritative Caps Lock synchronization
+
+    func currentCapsLockState() -> Bool? {
+        capsAuthority?.currentState()
+    }
+
+    // Registers a receiver session for authoritative Caps Lock state broadcasts
+    // and immediately delivers the current snapshot if available. Runs before
+    // streamConfig so the receiver worker buffers the initial state across welcome -> active.
+    func registerCapsLockSubscriber(sessionID: UInt64, notify: @escaping (Bool) -> Void) {
+        let initial = capsAuthority?.currentState()
+        lock.lock()
+        let previous = lastPublishedCaps
+        let existing = Array(capsSubscribers.values)
+        capsSubscribers[sessionID] = notify
+        if let initial {
+            lastPublishedCaps = initial
+            // Peers that already exist missed a change the poll has not seen yet.
+            if let previous, previous != initial {
+                for peer in existing { peer(initial) }
+            }
+            // Everything below runs under the lock, so no broadcast can overtake this snapshot.
+            notify(initial)
+        }
+        lock.unlock()
+        scheduleCapsPollUpdate()
+    }
+
+    func unregisterCapsLockSubscriber(sessionID: UInt64) {
+        lock.lock()
+        capsSubscribers.removeValue(forKey: sessionID)
+        if capsSubscribers.isEmpty { lastPublishedCaps = nil }
+        lock.unlock()
+        scheduleCapsPollUpdate()
+    }
+
+    // Creates or cancels the Caps Lock poll on the input queue, so the timer is only
+    // touched there and matches the subscriber set at the time it runs.
+    private func scheduleCapsPollUpdate() {
+        guard live, capsAuthority != nil else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let wanted = !self.capsSubscribers.isEmpty
+            self.lock.unlock()
+            if wanted && self.capsPollTimer == nil {
+                let interval = DispatchTimeInterval.nanoseconds(Int(self.capsPollIntervalNs))
+                let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(20))
+                timer.setEventHandler { [weak self] in self?.pollCapsLockState() }
+                self.capsPollTimer = timer
+                timer.resume()
+            } else if !wanted, let timer = self.capsPollTimer {
+                timer.cancel()
+                self.capsPollTimer = nil
+            }
+        }
+    }
+
+    // Polls the authoritative Mac Caps Lock state and broadcasts any change
+    // (for example, a press on the Mac's own physical keyboard) to all subscribed
+    // receivers. Safe to call directly in deterministic unit tests.
+    func pollCapsLockState() {
+        guard let current = capsAuthority?.currentState() else { return }
+        publishCapsLockIfChanged(current)
+    }
+
+    private func publishCapsLockIfChanged(_ state: Bool) {
+        lock.lock()
+        guard lastPublishedCaps != state else {
+            lock.unlock()
+            return
+        }
+        lastPublishedCaps = state
+        let subscribers = Array(capsSubscribers.values)
+        lock.unlock()
+        for notify in subscribers {
+            notify(state)
+        }
+    }
+
+    // Applies an absolute Caps Lock state on macOS and broadcasts the resulting
+    // actual state to every subscribed receiver. Runs synchronously on
+    // InputCoordinator.queue so subsequent keys cannot overtake the transition.
+    @discardableResult
+    func setCapsLockState(_ desired: Bool) -> Bool? {
+        guard let authority = capsAuthority else { return nil }
+        if authority.currentState() == desired {
+            publishCapsLockIfChanged(desired)
+            return desired
+        }
+        if authority.setState(desired) {
+            _ = authority.waitUntilConfirmed(desired)
+        }
+        let actual = authority.currentState() ?? desired
+        publishCapsLockIfChanged(actual)
+        return actual
+    }
+
+    @discardableResult
+    func toggleCapsLockState() -> Bool? {
+        guard let authority = capsAuthority,
+              let current = authority.currentState() else { return nil }
+        return setCapsLockState(!current)
     }
 
     // MARK: - Merged HID keyboard state
@@ -519,7 +735,8 @@ final class RemoteInput {
     private let now: () -> TimeInterval
     private let timerQueue: DispatchQueue
     private let coordinator: InputCoordinator
-    private let sessionID: UInt64
+    let sessionID: UInt64
+    private let capsSyncNegotiated: Bool
     private var detached = false
     // A real HID-state source for pointer/mouse/scroll/touch/tablet: menu
     // tracking treats sourceless synthetic clicks as malformed.
@@ -587,10 +804,12 @@ final class RemoteInput {
         set { coordinator.updatePointerTime(newValue) }
     }
 
-    init(displayID: CGDirectDisplayID, coordinator: InputCoordinator = .shared, queue: DispatchQueue? = nil) {
+    init(displayID: CGDirectDisplayID, coordinator: InputCoordinator = .shared, queue: DispatchQueue? = nil,
+         capsSyncNegotiated: Bool = false) {
         self.coordinator = coordinator
         let reg = coordinator.registerSession()
         self.sessionID = reg.sessionID
+        self.capsSyncNegotiated = capsSyncNegotiated
         self.tabletDeviceID = reg.tabletDeviceID
         bounds = { CGDisplayBounds(displayID) }
         displays = {
@@ -625,7 +844,8 @@ final class RemoteInput {
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          sink: @escaping Sink,
          virtualKeyboard: VirtualKeyboardBackend? = nil,
-         coordinator: InputCoordinator? = nil) {
+         coordinator: InputCoordinator? = nil,
+         capsSyncNegotiated: Bool = false) {
         let coord = coordinator ?? InputCoordinator(live: false, virtualKeyboard: virtualKeyboard)
         self.coordinator = coord
         let reg = coord.registerSession()
@@ -634,6 +854,7 @@ final class RemoteInput {
         self.bounds = bounds
         self.displays = { [bounds()] }
         self.live = false
+        self.capsSyncNegotiated = capsSyncNegotiated
         self.now = now
         self.timerQueue = .main
         self.sink = sink
@@ -648,6 +869,7 @@ final class RemoteInput {
         heldHid.removeAll()
         held.removeAll()
         coordinator.clearHid(sessionID: sessionID, hadKeys: hadHid, forceResetIfEmpty: false)
+        coordinator.unregisterCapsLockSubscriber(sessionID: sessionID)
         coordinator.unregisterSession(sessionID)
     }
 
@@ -1458,6 +1680,12 @@ final class RemoteInput {
             }
         }
         switch type {
+        case "capsLockToggle":
+            guard capsSyncNegotiated else { return }
+            _ = coordinator.toggleCapsLockState()
+        case "capsLockState":
+            // macOS is the sole authority. A receiver must never overwrite it.
+            return
         case "key":
             let identity = KeyIdentity(device: try Wire.integer(object, "device", 1...Int(UInt32.max)), code: try Wire.integer(object, "code", 0...767))
             let state = try Wire.integer(object, "state", 0...2)
@@ -1465,8 +1693,16 @@ final class RemoteInput {
             let mapping = object["mapping"] as? String
             guard mapping == "logical" || mapping == "physical" else { throw SenderError("Unsupported keyboard mapping") }
             // The wire reports the state before the event. Apply the key's
-            // own transition on top of it for flagsChanged events.
-            let before = KeyMapping.flags(modifiers, locks)
+            // own transition on top of it for flagsChanged events. When Caps
+            // Lock sync is negotiated, macOS owns AlphaShift so fallback CGEvents
+            // follow the authoritative Mac state instead of stripped wire bits.
+            var before = KeyMapping.flags(modifiers, locks)
+            if capsSyncNegotiated {
+                before.remove(.maskAlphaShift)
+                if coordinator.currentCapsLockState() == true {
+                    before.insert(.maskAlphaShift)
+                }
+            }
             if state == 0 {
                 if let releasedHid = heldHid.removeValue(forKey: identity) {
                     if !coordinator.updateHid(sessionID: sessionID, heldHid: heldHid, changed: releasedHid) {
@@ -1517,7 +1753,14 @@ final class RemoteInput {
                 } else {
                     sym = UInt32(try Wire.integer(object, "keysym", 0...Int(UInt32.max)))
                 }
-                if let vk = coordinator.backend, vk.isReady, let hid = KeyMap.hidKey(forEvdev: identity.code) {
+                // With capsLock negotiated the receiver owns Caps Lock: its Caps
+                // keysym arrives only as capsLockToggle, so a Caps keysym here is ignored.
+                if capsSyncNegotiated && sym == 0xffe5 { return }   // XK_Caps_Lock; 0xffe6 is Shift_Lock
+                // Evdev 58 whose keysym is not Caps is a remapped key (for example Control).
+                // In this mode it must never take the Caps Lock physical or HID mapping.
+                let capsPosition = capsSyncNegotiated && identity.code == 58
+                if let vk = coordinator.backend, vk.isReady, !capsPosition,
+                   let hid = KeyMap.hidKey(forEvdev: identity.code) {
                     heldHid[identity] = hid
                     if coordinator.updateHid(sessionID: sessionID, heldHid: heldHid, changed: hid) {
                         let activeMods = coordinator.mergedSemanticModifierFlags()
@@ -1531,7 +1774,7 @@ final class RemoteInput {
                     heldHid.removeAll()
                 }
                 var mapped: MappedKey
-                if identity.code > 0, (sym != 0 || mapping == "physical"),
+                if identity.code > 0, !capsPosition, (sym != 0 || mapping == "physical"),
                    let macCode = KeyMap.macKeyCode(forEvdev: identity.code) {
                     mapped = MappedKey(
                         code: macCode,

@@ -162,12 +162,15 @@ enum DisplayModeTests {
             .replacingOccurrences(of: "\"host\":\"x1-yoga\"", with: "\"host\":\"workstation\"")
             .replacingOccurrences(of: "\"model\":\"20QD0000US\"", with: "\"model\":\"CustomDesktop\"")
             .replacingOccurrences(of: "\"hostId\":\"hostid-x1yoga-001\"", with: "\"hostId\":\"hostid-desk-002\"")
+        let defaultHostHello = baseHello
+            .replacingOccurrences(of: "\"host\":\"x1-yoga\"", with: "\"host\":\"locachy\"")
         let legacyHello = """
         {"type":"hello","pv":3,"locachy":1,"device":"LOCachy","pixelsWide":1920,"pixelsHigh":1080,"scale":2.0,"panel":{"width":1920,"height":1080,"scale":2.0},"displayMaxFrameRate":60,"extendedOnly":true,"videoCaps":[{"codec":"h264","maxWidth":4096,"maxHeight":4096,"maxFramesPerSecond":60}],"input":["key","button","cancel","pointer","scroll"]}
         """
         guard let p1 = try? Panel(hello: Wire.object(Data(baseHello.utf8))),
               let p1Again = try? Panel(hello: Wire.object(Data(baseHello.utf8))),
               let p2 = try? Panel(hello: Wire.object(Data(secondHello.utf8))),
+              let pDefaultHost = try? Panel(hello: Wire.object(Data(defaultHostHello.utf8))),
               let pLegacy = try? Panel(hello: Wire.object(Data(legacyHello.utf8))) else {
             check(false, "parses hello payloads for display identity tests")
             return
@@ -176,12 +179,15 @@ enum DisplayModeTests {
         let id1 = VirtualDisplayIdentity.derive(from: p1)
         let id1Again = VirtualDisplayIdentity.derive(from: p1Again)
         let id2 = VirtualDisplayIdentity.derive(from: p2)
+        let idDefaultHost = VirtualDisplayIdentity.derive(from: pDefaultHost)
         let idLegacy = VirtualDisplayIdentity.derive(from: pLegacy)
 
         check(id1 == id1Again && id1.serialNum != 0,
               "VirtualDisplayIdentity.derive is deterministic and non-zero for the same receiver")
-        check(id1.serialNum != id2.serialNum && id1.name == "LOCachy (x1-yoga)" && id2.name == "LOCachy (workstation)",
-              "VirtualDisplayIdentity.derive produces distinct serialNum and labels for two receivers")
+        check(id1.serialNum != id2.serialNum && id1.name == "LOCachy-x1-yoga" && id2.name == "LOCachy-workstation",
+              "VirtualDisplayIdentity.derive produces distinct serialNum and LOCachy-<host> labels for two receivers")
+        check(idDefaultHost.name == "LOCachy-20QD0000US",
+              "VirtualDisplayIdentity.derive avoids LOCachy-locachy by falling back to machine model")
         check((id1.productID & 0xFF00) == 0x4C00 && (id2.productID & 0xFF00) == 0x4C00,
               "VirtualDisplayIdentity.derive places productID inside 0x4C00...0x4CFF")
         check(idLegacy.name == "LOCachy" && idLegacy.serialNum != 0,

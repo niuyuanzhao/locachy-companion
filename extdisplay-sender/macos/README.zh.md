@@ -28,7 +28,7 @@ brew services start locachy-macos-sender
 ## 多屏并行会话与持久配对
 
 - **多接收端同时在线**：在已有扩展屏串流时，雷电链路监听与 Bonjour 发现保持常开；新接入第二台、第三台 LOCachy 时会自动建立各自独立的虚拟显示器、采集通道与 VideoToolbox 硬件编码会话，不会打断现有屏幕。
-- **稳定的每设备虚拟显示器标识**：每个虚拟显示器按接收端的 `hostId`（无 `hostId` 时回退至 `host`、`model` 与面板尺寸）确定性推导非零 `serialNum`、`productID`（`0x4C00–0x4CFF`）以及显示名称（`LOCachy (<host>)`），并在进程内避免冲突，使 macOS 独立记住每台 LOCachy 的排列位置、分辨率、HiDPI 缩放与色彩配置。
+- **稳定的每设备虚拟显示器标识**：每个虚拟显示器按接收端的 `hostId`（无 `hostId` 时回退至 `host`、`model` 与面板尺寸）确定性推导非零 `serialNum`、`productID`（`0x4C00–0x4CFF`）以及显示名称（`LOCachy-<host>`；主机名未设置或为 `locachy` 时回退到机器型号或 `hostId` 短前缀），并在进程内避免冲突，使 macOS 独立记住每台 LOCachy 的排列位置、分辨率、HiDPI 缩放与色彩配置。
 - **一次配对持久复用（`peers.json`）**：支持携带 `hostid=` 与 `paired=1`（可省去明文 `code=`）的新版广播，凭据以原子写入方式保存在 `~/Library/Application Support/LOCachy/peers.json`（目录 `0700`、文件 `0600`）；对仅广播临时配对码的旧版接收端保持 100% 向后兼容且不落盘临时码。
   - 可在连接窗口点击 **Pair…** 粘贴 LOCachy 生成的配对口令，或通过命令行导入（命令行从标准输入读取口令，避免长期密钥出现在进程列表中）：
     ```sh

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Pure fixtures: no interface enumeration, discovery, UI, TCC or Mac session.
 import Darwin
+import dnssd
 import Foundation
+import Security
 
 @main
 enum ConnectionTests {
@@ -15,8 +17,8 @@ enum ConnectionTests {
             let bytes = Array(field.utf8); result.append(UInt8(bytes.count)); result.append(contentsOf: bytes)
         }
     }
-    static func interface(_ name: String, _ index: UInt32, bridge: Bool = false, ready: Bool = true) -> LinkInterfaces.Interface {
-        LinkInterfaces.Interface(name: name, index: index, bridge: bridge, ready: ready)
+    static func interface(_ name: String, _ index: UInt32, bridge: Bool = false, ready: Bool = true, carrierActive: Bool = true) -> LinkInterfaces.Interface {
+        LinkInterfaces.Interface(name: name, index: index, bridge: bridge, ready: ready, carrierActive: carrierActive)
     }
     static func main() {
         let physical = [interface("wiredA", 4), interface("wiredB", 7), interface("wifi", 8)]
@@ -28,13 +30,56 @@ enum ConnectionTests {
         let withVMBridges = ports + [interface("vmenet0", 27), interface("bridge100", 28, bridge: true)]
         let ignoredVM = LinkInterfaces.classify(withVMBridges, thunderbolt: ["wiredA", "wiredB"],
                                                 members: ["ipnet": ["wiredA", "wiredB"], "bridge100": ["vmenet0"]])
-        check(ignoredVM.links == [CableLink(name: "ipnet", index: 20, bridged: true)], "ignores unrelated non-Thunderbolt VM bridges")
+        check(ignoredVM.links == [CableLink(name: "ipnet", index: 20, bridged: true)] && ignoredVM.isCertain,
+              "ignores unrelated non-Thunderbolt VM bridges")
+        let unreadableVM = LinkInterfaces.classify(withVMBridges, thunderbolt: ["wiredA", "wiredB"],
+                                                   members: ["ipnet": ["wiredA", "wiredB"]])
+        let ipnetLink = CableLink(name: "ipnet", index: 20, bridged: true)
+        check(unreadableVM.links == [ipnetLink]
+              && unreadableVM.activePorts == ["wiredA", "wiredB"]
+              && unreadableVM.complete
+              && unreadableVM.undetermined == ["bridge100"]
+              && !unreadableVM.isCertain
+              && unreadableVM.determines(ipnetLink)
+              && !unreadableVM.isLost(ipnetLink),
+              "does not let an unreadable unrelated bridge poison a verified Thunderbolt bridge")
         let mixed = LinkInterfaces.classify(ports, thunderbolt: ["wiredA"], members: ["ipnet": ["wiredA", "wiredB"]])
-        check(mixed.links.isEmpty, "rejects a bridge mixed with ordinary Ethernet and never bypasses through a member")
-        check(LinkInterfaces.classify(ports, thunderbolt: ["wiredA", "wiredB"], members: [:]).links.isEmpty,
-              "fails closed when bridge membership cannot be inspected")
+        check(mixed.links.isEmpty && mixed.isCertain, "rejects a bridge mixed with ordinary Ethernet and never bypasses through a member")
+        let unreadableAll = LinkInterfaces.classify(ports, thunderbolt: ["wiredA", "wiredB"], members: [:])
+        check(unreadableAll.links.isEmpty
+              && !unreadableAll.isCertain
+              && !unreadableAll.determines(ipnetLink)
+              && !unreadableAll.isLost(ipnetLink)
+              && !unreadableAll.isLost(CableLink(name: "wiredA", index: 4, bridged: false)),
+              "fails closed for dialing when bridge membership cannot be inspected without reporting the link lost")
+        let failedInspect = LinkSnapshot(links: [], message: "Cannot read the network interface list.", complete: false)
+        check(!failedInspect.isCertain && !failedInspect.determines(ipnetLink) && !failedInspect.isLost(ipnetLink),
+              "treats an incomplete inspection snapshot as unknown rather than lost")
         check(LinkInterfaces.classify([interface("wiredA", 4, ready: false)], thunderbolt: ["wiredA"], members: [:]).links.isEmpty,
               "waits for carrier and link-local IPv6 instead of dialing a down link")
+        let bridgeAllUnplugged = [
+            interface("wiredA", 4, ready: false, carrierActive: false),
+            interface("wiredB", 7, ready: false, carrierActive: false),
+            interface("ipnet", 20, bridge: true, ready: true, carrierActive: true)
+        ]
+        let unpluggedSnap = LinkInterfaces.classify(bridgeAllUnplugged, thunderbolt: ["wiredA", "wiredB"],
+                                                    members: ["ipnet": ["wiredA", "wiredB"]])
+        check(unpluggedSnap.links.isEmpty && unpluggedSnap.activePorts.isEmpty
+              && unpluggedSnap.isCertain && unpluggedSnap.isLost(ipnetLink),
+              "treats a bridge as offline and lost when all Thunderbolt member ports have no physical carrier")
+        let bridgeOneActive = [
+            interface("wiredA", 4, ready: false, carrierActive: true),
+            interface("wiredB", 7, ready: false, carrierActive: false),
+            interface("ipnet", 20, bridge: true, ready: true, carrierActive: true)
+        ]
+        let oneActiveSnap = LinkInterfaces.classify(bridgeOneActive, thunderbolt: ["wiredA", "wiredB"],
+                                                    members: ["ipnet": ["wiredA", "wiredB"]])
+        check(oneActiveSnap.links == [CableLink(name: "ipnet", index: 20, bridged: true)]
+              && oneActiveSnap.activePorts == ["wiredA"],
+              "accepts a Thunderbolt bridge and reports activePorts once a member has carrier")
+        check(LinkInterfaces.classify([interface("wiredA", 4, ready: true, carrierActive: false)],
+                                      thunderbolt: ["wiredA"], members: [:]).links.isEmpty,
+              "ignores a standalone Thunderbolt port without active hardware carrier")
         let snapshot = Data("ipnet: flags=8863<UP>\n\tmember: wiredA flags=3<LEARNING,DISCOVER>\n\tmember: wiredB flags=3\n".utf8)
         check((try? LinkInterfaces.bridgeMembers(snapshot, interface: "ipnet", known: ["wiredA", "wiredB"])) == ["wiredA", "wiredB"],
               "parses bounded read-only ifconfig bridge output")
@@ -89,6 +134,40 @@ enum ConnectionTests {
         check(DiscoveryProfile.preferred([a, b], previous: nil) == nil, "requires a choice when more than one receiver is found")
         check(DiscoveryProfile.preferred([b, a], previous: a.id) == a.id, "keeps the chosen identity when discovery order changes")
         check(DiscoveryProfile.preferred([], previous: a.id) == nil, "forgets a removed receiver")
+
+        // Discovery error classification & reconnect backoff tests
+        check(DiscoveryErrorClassifier.isPolicyDenied(DNSServiceErrorType(kDNSServiceErr_PolicyDenied))
+              && DiscoveryErrorClassifier.isPolicyDenied(DNSServiceErrorType(kDNSServiceErr_NotPermitted))
+              && !DiscoveryErrorClassifier.isPolicyDenied(DNSServiceErrorType(kDNSServiceErr_BadInterfaceIndex))
+              && !DiscoveryErrorClassifier.isPolicyDenied(DNSServiceErrorType(kDNSServiceErr_NoSuchRecord))
+              && !DiscoveryErrorClassifier.isPolicyDenied(DNSServiceErrorType(kDNSServiceErr_Timeout)),
+              "distinguishes Local Network policy denials from transient DNS-SD hotplug errors")
+
+        check(!SecureTransport.isAuthFailure(tlsStatus: errSSLTransportReset)
+              && !SecureTransport.isAuthFailure(tlsStatus: errSSLNetworkTimeout)
+              && !SecureTransport.isAuthFailure(tlsStatus: errSSLClosedAbort)
+              && !SecureTransport.isAuthFailure(tlsStatus: errSSLConnectionRefused)
+              && SecureTransport.isAuthFailure(tlsStatus: errSSLUnknownPSKIdentity)
+              && SecureTransport.isAuthFailure(tlsStatus: errSSLPeerBadRecordMac)
+              && SecureTransport.isAuthFailure(tlsStatus: errSSLPeerHandshakeFail),
+              "treats transport-level TLS errors as transient cable drops rather than permanent auth failures")
+
+        var backoff = ReconnectBackoff()
+        check(backoff.canAttempt("peer-a", now: 100.0), "ReconnectBackoff allows immediate first attempt")
+        let d1 = backoff.recordFailure(for: "peer-a", now: 100.0)
+        let d2 = backoff.recordFailure(for: "peer-a", now: 102.0)
+        let d3 = backoff.recordFailure(for: "peer-a", now: 106.0)
+        let d4 = backoff.recordFailure(for: "peer-a", now: 112.0)
+        let d5 = backoff.recordFailure(for: "peer-a", now: 124.0)
+        let d6 = backoff.recordFailure(for: "peer-a", now: 148.0)
+        check(d1 == 1.5 && d2 == 3.0 && d3 == 6.0 && d4 == 12.0 && d5 == 24.0 && d6 == 30.0
+              && !backoff.canAttempt("peer-a", now: 150.0)
+              && backoff.canAttempt("peer-a", now: 178.0)
+              && backoff.canAttempt("peer-b", now: 150.0),
+              "ReconnectBackoff grows exponentially per peer up to 30s without blocking other peers")
+        backoff.reset(for: "peer-a")
+        check(backoff.canAttempt("peer-a", now: 150.0) && backoff.failureCount(for: "peer-a") == 0,
+              "ReconnectBackoff resets immediately on replug or successful connect")
 
         // PeerStore tests (isolated in a temporary directory)
         let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("locachy-peerstore-\(UUID().uuidString)", isDirectory: true)

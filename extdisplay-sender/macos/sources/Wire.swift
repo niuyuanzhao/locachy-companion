@@ -19,7 +19,9 @@ enum Wire {
     static let pskSuite: UInt16 = 0x00A8
     static let alpn = "locachy-extdisplay-v1"
     static let capabilities = ["key", "button", "cancel", "pointer", "scroll"]
-    static let optionalCapabilities = ["touch", "tablet"]
+    static let optionalCapabilities = ["touch", "tablet", "capsLock"]
+    // Mac-authoritative Caps Lock state: {"type":"capsLockState","caps":Bool} (two keys only).
+    static let capsLockStateField = "caps"
 
     static func frame(_ payload: Data) throws -> Data {
         guard !payload.isEmpty, payload.count <= maxFrame else { throw SenderError("Invalid frame size") }
@@ -98,8 +100,21 @@ struct Panel: Equatable {
     }
 
     var displayLabel: String {
-        let base = !hostName.isEmpty ? hostName : (deviceName != "LOCachy" ? deviceName : "")
-        return base.isEmpty ? "LOCachy" : "LOCachy (\(base))"
+        let host = hostName.lowercased() == "locachy" ? "" : hostName
+        let device = deviceName.lowercased() == "locachy" ? "" : deviceName
+        let suffix: String
+        if !host.isEmpty {
+            suffix = host
+        } else if !device.isEmpty {
+            suffix = device
+        } else if !machineModel.isEmpty {
+            suffix = machineModel
+        } else if let hostID, !hostID.isEmpty {
+            suffix = String(hostID.prefix(8))
+        } else {
+            suffix = ""
+        }
+        return suffix.isEmpty ? "LOCachy" : "LOCachy-\(suffix)"
     }
 
     private static func sanitizeHostID(_ raw: String?) -> String? {

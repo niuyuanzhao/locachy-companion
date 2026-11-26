@@ -53,6 +53,7 @@ enum ProtocolTests {
         modifierRepeatTests()
         commandSideTests()
         capsLockTests()
+        capsLockSyncTests()
         physicalAndVirtualHidTests()
         tabletAndTouchTests()
         multiSessionTests()
@@ -354,6 +355,72 @@ enum ProtocolTests {
                   "motion, button and scroll events retain the held Right Command flags")
         } catch {
             check(false, "Command sides: \(error)")
+        }
+    }
+
+    final class FakeCapsLockAuthority: CapsLockAuthority {
+        var state: Bool
+        var setCalls: [Bool] = []
+        init(_ initial: Bool = false) { state = initial }
+        func currentState() -> Bool? { state }
+        func setState(_ on: Bool) -> Bool {
+            setCalls.append(on)
+            state = on
+            return true
+        }
+        func waitUntilConfirmed(_ desired: Bool) -> Bool { state == desired }
+    }
+
+    static func capsLockSyncTests() {
+        let bounds = { CGRect(x: 0, y: 0, width: 1920, height: 1200) }
+        let auth = FakeCapsLockAuthority(false)
+        let fakeHid = FakeVirtualKeyboard(ready: true)
+        let coord = InputCoordinator(live: false, virtualKeyboard: fakeHid, capsAuthority: auth)
+        let recA = Recorder(), recB = Recorder()
+        let inputA = RemoteInput(bounds: bounds, sink: { recA.posted.append($0) }, coordinator: coord, capsSyncNegotiated: true)
+        let inputB = RemoteInput(bounds: bounds, sink: { recB.posted.append($0) }, coordinator: coord, capsSyncNegotiated: true)
+        var updatesA: [Bool] = [], updatesB: [Bool] = []
+        coord.registerCapsLockSubscriber(sessionID: inputA.sessionID) { updatesA.append($0) }
+        coord.registerCapsLockSubscriber(sessionID: inputB.sessionID) { updatesB.append($0) }
+        check(updatesA == [false] && updatesB == [false],
+              "negotiated Caps Lock delivers initial Mac snapshot to each receiver")
+        do {
+            // Receiver A toggles Caps Lock: Mac authority flips and broadcasts to A and B.
+            try inputA.handle(["type": "capsLockToggle"])
+            check(auth.state == true && auth.setCalls == [true] && updatesA == [false, true] && updatesB == [false, true],
+                  "capsLockToggle flips Mac authority and broadcasts to every subscribed receiver")
+            // A stray receiver capsLockState must never overwrite Mac authority.
+            try inputB.handle(["type": "capsLockState", "caps": false])
+            check(auth.state == true && auth.setCalls == [true],
+                  "receiver capsLockState is ignored; macOS remains sole authority")
+            // Local change on Mac keyboard is broadcast by polling to all receivers.
+            auth.state = false
+            coord.pollCapsLockState()
+            check(updatesA == [false, true, false] && updatesB == [false, true, false],
+                  "local Mac Caps Lock change broadcasts to all receivers")
+            // Physical Caps key (sym 0xffe5) is suppressed in negotiated mode without HID Caps injection.
+            let hidCountBefore = fakeHid.keyboardReports.count
+            try logicalKey(inputA, 58, 0xffe5, 1)
+            check(fakeHid.keyboardReports.count == hidCountBefore && auth.state == false,
+                  "physical Caps Lock key event is ignored when capsLock sync is negotiated")
+            // Remapped evdev 58 -> Control_L must not inject HID Caps Lock (0x39).
+            try logicalKey(inputA, 58, 0xffe3, 1)
+            try logicalKey(inputA, 58, 0xffe3, 0)
+            check(fakeHid.keyboardReports.count == hidCountBefore
+                  && recA.posted.contains(where: { $0.type == .flagsChanged && $0.flags.contains(.maskControl) })
+                  && !recA.posted.contains(where: { $0.getIntegerValueField(.keyboardEventKeycode) == 57 }),
+                  "remapped evdev 58 (Control) bypasses HID Caps Lock and posts Control")
+            // Fallback CGEvent path (no HID) reflects authoritative Mac Caps Lock even with stripped wire bits.
+            let fbCoord = InputCoordinator(live: false, virtualKeyboard: nil, capsAuthority: auth)
+            let fbRec = Recorder()
+            let fbInput = RemoteInput(bounds: bounds, sink: { fbRec.posted.append($0) }, coordinator: fbCoord, capsSyncNegotiated: true)
+            auth.state = true
+            try logicalKey(fbInput, 30, 0x61, 1, modifiers: 0, locks: 0)
+            try logicalKey(fbInput, 30, 0x61, 0, modifiers: 0, locks: 0)
+            check(fbRec.posted.count == 2 && fbRec.posted.allSatisfy { $0.flags.contains(.maskAlphaShift) },
+                  "fallback CGEvent keys reflect authoritative Mac Caps Lock when wire lock bits are stripped")
+        } catch {
+            check(false, "negotiated Caps Lock sync: \(error)")
         }
     }
 

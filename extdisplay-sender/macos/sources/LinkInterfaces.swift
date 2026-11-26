@@ -13,6 +13,27 @@ struct CableLink: Equatable, Hashable {
 struct LinkSnapshot {
     var links: [CableLink]
     var message: String
+    var activePorts: Set<String>
+    // A failed check is not an unplug. `complete` is false when the interface or
+    // Thunderbolt list could not be read at all; `undetermined` names interfaces
+    // whose state could not be established (an unreadable bridge, or a standalone
+    // port while some bridge is unreadable). Both stay fail-closed for dialing.
+    var complete: Bool
+    var undetermined: Set<String>
+
+    init(links: [CableLink], message: String, activePorts: Set<String> = [],
+         complete: Bool = true, undetermined: Set<String> = []) {
+        self.links = links
+        self.message = message
+        self.activePorts = activePorts
+        self.complete = complete
+        self.undetermined = undetermined
+    }
+
+    var isCertain: Bool { complete && undetermined.isEmpty }
+    func determines(_ link: CableLink) -> Bool { complete && !undetermined.contains(link.name) }
+    // Only a link this check established can be reported as gone.
+    func isLost(_ link: CableLink) -> Bool { determines(link) && !links.contains { $0.index == link.index } }
 }
 
 // Classification is separate from the system queries so bridge and hotplug cases
@@ -23,6 +44,15 @@ enum LinkInterfaces {
         let index: UInt32
         let bridge: Bool
         let ready: Bool
+        let carrierActive: Bool
+
+        init(name: String, index: UInt32, bridge: Bool, ready: Bool, carrierActive: Bool = true) {
+            self.name = name
+            self.index = index
+            self.bridge = bridge
+            self.ready = ready
+            self.carrierActive = carrierActive
+        }
     }
 
     static func validName(_ name: String) -> Bool {
@@ -36,13 +66,21 @@ enum LinkInterfaces {
                          members: [String: [String]]) -> LinkSnapshot {
         let known = Dictionary(interfaces.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
         var covered = Set<String>(), accepted: [CableLink] = []
+        var activePorts = Set<String>()
+        var undetermined = Set<String>()
         var unverifiedBridge = false
         for interface in interfaces where interface.bridge {
-            guard let ports = members[interface.name], !ports.isEmpty, ports.count <= 32,
+            guard let ports = members[interface.name] else {
+                undetermined.insert(interface.name)
+                unverifiedBridge = true
+                continue
+            }
+            guard !ports.isEmpty, ports.count <= 32,
                   Set(ports).count == ports.count,
                   ports.allSatisfy({ known[$0] != nil }) else {
                 // Never bypass an uninspectable bridge by dialing a member.
-                covered.formUnion(members[interface.name] ?? [])
+                covered.formUnion(ports)
+                if !ports.isEmpty { undetermined.insert(interface.name) }
                 unverifiedBridge = true
                 continue
             }
@@ -59,24 +97,38 @@ enum LinkInterfaces {
                 continue
             }
             covered.formUnion(ports)
-            if interface.ready { accepted.append(CableLink(name: interface.name, index: interface.index, bridged: true)) }
-        }
-        // An unreadable bridge map cannot prove that a physical port is not a
-        // member. Fail closed rather than widening the path to an unknown LAN.
-        let unreadableBridge = interfaces.contains { $0.bridge && members[$0.name] == nil }
-        if !unreadableBridge {
-            for interface in interfaces where !interface.bridge && interface.ready
-                && thunderbolt.contains(interface.name) && !covered.contains(interface.name) {
-                accepted.append(CableLink(name: interface.name, index: interface.index, bridged: false))
+            // macOS keeps bridge0 UP|RUNNING with fe80:: even when every Thunderbolt
+            // cable is unplugged. Require an active physical carrier on at least one
+            // Thunderbolt bridge member before treating the bridge link as ready.
+            let activeMembers = ports.filter { known[$0]?.carrierActive == true }
+            if interface.ready && !activeMembers.isEmpty {
+                accepted.append(CableLink(name: interface.name, index: interface.index, bridged: true))
+                activePorts.formUnion(activeMembers)
             }
-        } else { accepted.removeAll() }
+        }
+        // An unreadable bridge map cannot prove that a standalone port is not a
+        // member. Fail closed for those ports (never dial them) rather than widening
+        // the path to an unknown LAN, but do not call them lost either. A verified
+        // Thunderbolt-only bridge stays usable: xnu's bridge_ioctl_add refuses a
+        // member that already belongs to a bridge (EBUSY) and any bridge as a member.
+        let unreadableBridge = !undetermined.isEmpty
+        for interface in interfaces where !interface.bridge && interface.ready
+            && interface.carrierActive
+            && thunderbolt.contains(interface.name) && !covered.contains(interface.name) {
+            if unreadableBridge {
+                undetermined.insert(interface.name)
+            } else {
+                accepted.append(CableLink(name: interface.name, index: interface.index, bridged: false))
+                activePorts.insert(interface.name)
+            }
+        }
         accepted.sort { $0.name < $1.name }
         let message: String
         if !accepted.isEmpty { message = "Thunderbolt link ready. Looking for LOCachy…" }
         else if unverifiedBridge { message = "Cannot verify a Thunderbolt-only bridge." }
         else if !thunderbolt.isEmpty { message = "Waiting for the Thunderbolt network link and its IPv6 address…" }
         else { message = "Connect the Thunderbolt/USB4 cable, directly or through a compatible hub or dock." }
-        return LinkSnapshot(links: accepted, message: message)
+        return LinkSnapshot(links: accepted, message: message, activePorts: activePorts, undetermined: undetermined)
     }
 
     static func bridgeMembers(_ output: Data, interface: String, known: Set<String>) throws -> [String] {
@@ -98,7 +150,7 @@ enum LinkInterfaces {
     static func inspect() -> LinkSnapshot {
         var addresses: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&addresses) == 0, let first = addresses else {
-            return LinkSnapshot(links: [], message: "Cannot read the network interface list.")
+            return LinkSnapshot(links: [], message: "Cannot read the network interface list.", complete: false)
         }
         defer { freeifaddrs(first) }
         var interfaces: [String: Interface] = [:]
@@ -124,18 +176,28 @@ enum LinkInterfaces {
             }
             cursor = item.ifa_next
         }
-        let list = interfaces.values.map { Interface(name: $0.name, index: $0.index, bridge: $0.bridge,
-                                                     ready: $0.ready && localIPv6.contains($0.name)) }
+        guard let tbPorts = thunderboltPorts() else {
+            return LinkSnapshot(links: [], message: "Cannot read the Thunderbolt interface list.", complete: false)
+        }
+        let list = interfaces.values.map { iface in
+            Interface(
+                name: iface.name,
+                index: iface.index,
+                bridge: iface.bridge,
+                ready: iface.ready && localIPv6.contains(iface.name),
+                carrierActive: tbPorts[iface.name] ?? true
+            )
+        }
         let known = Set(interfaces.keys)
         var bridges: [String: [String]] = [:]
         // No private SCBridgeInterface API, shell, sudo or configuration write.
-        for bridge in list.filter({ $0.bridge }).prefix(16) {
+        for bridge in list.filter({ $0.bridge }).sorted(by: { $0.name < $1.name }).prefix(16) {
             if let output = try? queryBridge(bridge.name),
                let members = try? bridgeMembers(output, interface: bridge.name, known: known) {
                 bridges[bridge.name] = members
             }
         }
-        return classify(list, thunderbolt: thunderboltNames(), members: bridges)
+        return classify(list, thunderbolt: Set(tbPorts.keys), members: bridges)
     }
 
     static func require(_ name: String, index: UInt32? = nil) throws {
@@ -145,11 +207,15 @@ enum LinkInterfaces {
         }
     }
 
-    private static func thunderboltNames() -> Set<String> {
+    // Returns each Thunderbolt IP BSD interface name mapped to whether its
+    // hardware carrier is currently active (IOLinkStatus has valid+active bits,
+    // or true if the driver does not publish IOLinkStatus). nil when the IOKit
+    // query itself fails, which proves nothing about the cable.
+    private static func thunderboltPorts() -> [String: Bool]? {
         var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IONetworkInterface"), &iterator) == KERN_SUCCESS else { return [] }
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IONetworkInterface"), &iterator) == KERN_SUCCESS else { return nil }
         defer { IOObjectRelease(iterator) }
-        var names = Set<String>()
+        var ports: [String: Bool] = [:]
         while true {
             let entry = IOIteratorNext(iterator)
             if entry == 0 { break }
@@ -159,20 +225,32 @@ enum LinkInterfaces {
             var ancestor = entry
             IOObjectRetain(ancestor)
             var isIP = false
+            var carrierActive: Bool? = nil
             for _ in 0..<128 {
+                if carrierActive == nil,
+                   let raw = IORegistryEntryCreateCFProperty(ancestor, "IOLinkStatus" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber {
+                    let status = raw.uint64Value
+                    // kIONetworkLinkValid = 0x1 (IFM_AVALID), kIONetworkLinkActive = 0x2 (IFM_ACTIVE)
+                    if (status & 0x1) != 0 {
+                        carrierActive = (status & 0x2) != 0
+                    }
+                }
                 // A generic Thunderbolt ancestor would also accept a dock's
                 // ordinary Ethernet adapter. Require the Thunderbolt IP driver.
                 if IOObjectConformsTo(ancestor, "AppleThunderboltIPPort") != 0
-                    || IOObjectConformsTo(ancestor, "AppleThunderboltIPService") != 0 { isIP = true; break }
+                    || IOObjectConformsTo(ancestor, "AppleThunderboltIPService") != 0 {
+                    isIP = true
+                    break
+                }
                 var parent: io_registry_entry_t = 0
                 if IORegistryEntryGetParentEntry(ancestor, kIOServicePlane, &parent) != KERN_SUCCESS { break }
                 IOObjectRelease(ancestor)
                 ancestor = parent
             }
             IOObjectRelease(ancestor)
-            if isIP { names.insert(name) }
+            if isIP { ports[name] = carrierActive ?? true }
         }
-        return names
+        return ports
     }
 
     private static func queryBridge(_ name: String) throws -> Data {
@@ -213,18 +291,34 @@ enum LinkInterfaces {
 }
 
 // AF_ROUTE reports changes on non-default links too. NWPathMonitor alone can
-// omit a secondary Thunderbolt path while Wi-Fi is the default route.
+// omit a secondary Thunderbolt path while Wi-Fi is the default route. IOKit
+// interest notifications on the Thunderbolt IP port driver are an extra signal
+// that has NOT been verified to fire on cable transitions: IOKit's controller
+// link-state path (IONetworkController::setLinkStatus) broadcasts to interfaces,
+// not to controller clients. Link snapshots remain the source of truth.
 final class LinkWatcher {
+    // Matches kIOMessageServiceIsTerminated = iokit_common_msg(0x010) in
+    // IOKit/IOMessage.h: (UInt32)(err_system(0x38) | err_sub(0) | 0x010).
+    // Defined explicitly because Swift does not import function-like C macros
+    // from IOKit/IOMessage.h.
+    private static let ioMessageServiceIsTerminated: UInt32 = 0xe000_0010
+
     private let queue = DispatchQueue(label: "locachy.sender.links")
     private let monitor = NWPathMonitor()
     private var route: DispatchSourceRead?
+    private var ioNotifyPort: IONotificationPortRef?
+    private var ioMatchIterators: [io_iterator_t] = []
+    private var ioInterestTokens: [UInt64: io_object_t] = [:]
+    private var ioFallbackInterestTokens: [io_object_t] = []
     private var pending: DispatchWorkItem?
     private var running = false
+    private var stopped = false
     var onChange: ((LinkSnapshot) -> Void)?
 
     func start() {
         guard !running else { return }
         running = true
+        stopped = false
         let fd = socket(PF_ROUTE, SOCK_RAW, 0)
         if fd >= 0 {
             _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
@@ -239,16 +333,109 @@ final class LinkWatcher {
             route = source
             source.resume()
         }
+        queue.async { [weak self] in self?.setupIOKitNotifications() }
         monitor.pathUpdateHandler = { [weak self] _ in self?.schedule() }
         monitor.start(queue: queue)
-        queue.async { self.schedule() }
+        queue.async { [weak self] in self?.schedule() }
     }
 
-    func refresh() { queue.async { self.schedule() } }
+    private func setupIOKitNotifications() {
+        guard !stopped, let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        IONotificationPortSetDispatchQueue(port, queue)
+        ioNotifyPort = port
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        for className in ["AppleThunderboltIPPort", "AppleThunderboltIPService"] {
+            var iter: io_iterator_t = 0
+            let kr = IOServiceAddMatchingNotification(
+                port,
+                kIOFirstMatchNotification,
+                IOServiceMatching(className),
+                { refcon, iterator in
+                    guard let refcon else { return }
+                    let watcher = Unmanaged<LinkWatcher>.fromOpaque(refcon).takeUnretainedValue()
+                    watcher.drainAndWatchPorts(iterator)
+                },
+                refcon,
+                &iter
+            )
+            if kr == KERN_SUCCESS {
+                ioMatchIterators.append(iter)
+                drainAndWatchPorts(iter)
+            }
+        }
+    }
+
+    private func drainAndWatchPorts(_ iterator: io_iterator_t) {
+        guard !stopped, let port = ioNotifyPort else { return }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        var sawAny = false
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            sawAny = true
+            var entryID: UInt64 = 0
+            let hasEntryID = IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS
+            if hasEntryID && ioInterestTokens[entryID] != nil {
+                IOObjectRelease(service)
+                continue
+            }
+            var token: io_object_t = 0
+            let kr = IOServiceAddInterestNotification(
+                port,
+                service,
+                kIOGeneralInterest,
+                { refcon, service, messageType, _ in
+                    guard let refcon else { return }
+                    let watcher = Unmanaged<LinkWatcher>.fromOpaque(refcon).takeUnretainedValue()
+                    watcher.handleInterest(service: service, messageType: messageType)
+                },
+                refcon,
+                &token
+            )
+            if kr == KERN_SUCCESS {
+                if hasEntryID {
+                    ioInterestTokens[entryID] = token
+                } else {
+                    ioFallbackInterestTokens.append(token)
+                }
+            }
+            IOObjectRelease(service)
+        }
+        if sawAny { schedule() }
+    }
+
+    private func handleInterest(service: io_service_t, messageType: UInt32) {
+        guard !stopped else { return }
+        if messageType == Self.ioMessageServiceIsTerminated {
+            var entryID: UInt64 = 0
+            if service != 0,
+               IORegistryEntryGetRegistryEntryID(service, &entryID) == KERN_SUCCESS,
+               let token = ioInterestTokens.removeValue(forKey: entryID) {
+                IOObjectRelease(token)
+            }
+        }
+        schedule()
+    }
+
+    private func teardownIOKitNotifications() {
+        for token in ioInterestTokens.values { IOObjectRelease(token) }
+        ioInterestTokens.removeAll()
+        for token in ioFallbackInterestTokens { IOObjectRelease(token) }
+        ioFallbackInterestTokens.removeAll()
+        for iter in ioMatchIterators { IOObjectRelease(iter) }
+        ioMatchIterators.removeAll()
+        if let port = ioNotifyPort {
+            IONotificationPortDestroy(port)
+            ioNotifyPort = nil
+        }
+    }
+
+    func refresh() { queue.async { [weak self] in self?.schedule() } }
     private func schedule() {
+        guard !stopped else { return }
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, !self.stopped else { return }
             let snapshot = LinkInterfaces.inspect()
             DispatchQueue.main.async { [weak self] in self?.onChange?(snapshot) }
         }
@@ -258,8 +445,20 @@ final class LinkWatcher {
     func stop() {
         monitor.cancel()
         route?.cancel(); route = nil
-        queue.async { self.pending?.cancel(); self.pending = nil }
         onChange = nil
+        // Asynchronous: an inspect() in flight can hold the queue for seconds
+        // (bridge queries), and quitting must not wait for it. onChange is already
+        // nil, so a snapshot finishing meanwhile reaches nobody.
+        queue.async {
+            self.stopped = true
+            self.pending?.cancel(); self.pending = nil
+            self.teardownIOKitNotifications()
+        }
     }
-    deinit { monitor.cancel(); route?.cancel(); pending?.cancel() }
+    deinit {
+        monitor.cancel()
+        route?.cancel()
+        pending?.cancel()
+        teardownIOKitNotifications()
+    }
 }
