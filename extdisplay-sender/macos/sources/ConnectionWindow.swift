@@ -18,7 +18,7 @@ struct PermissionState: Equatable {
 }
 
 @available(macOS 14.0, *)
-final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     private enum SessionState: Equatable {
         case connecting
         case active(String) // display label
@@ -66,13 +66,16 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var lastAutoTriedStored: [String: String] = [:]
     private var authFailedKeys = Set<String>()
     private var authFailedCode: [String: String] = [:]
-    private var manuallyDisconnectedKeys = Set<String>()
+    private var manualDisconnects = ManualDisconnectTracker()
+    private var manualDisconnectClearWork: DispatchWorkItem?
     private var sessionErrors: [String: String] = [:]
     private var reconnectBackoff = ReconnectBackoff()
     private var retryWorkItems: [String: DispatchWorkItem] = [:]
     private var immediateRetryCause: [String: String] = [:]
     private var lastLinks: [CableLink] = []
     private var lastActivePorts = Set<String>()
+    private var lastActiveConnections = Set<UInt64>()
+    private var lastMultiPeerDiagnostic = ""
     private static let linkLossConfirmDelay: TimeInterval = 0.5
     private var linkLossSince: TimeInterval?
     private var linkLossConfirmWork: DispatchWorkItem?
@@ -80,6 +83,9 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var problem: String?
     private var discoveryErrorIsPolicy = false
     private var lastPermissionsReady = PermissionState.current().ready
+    private var userOpenedWindow = false
+    private var statusItem: NSStatusItem?
+    private let statusMenu = NSMenu()
     private var terminating = false
     private var terminateReplied = false
     private var didResetTCC = false
@@ -88,6 +94,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
+        buildStatusItem()
         watcher.onChange = { [weak self] snapshot in
             self?.handleLinkSnapshot(snapshot)
         }
@@ -136,7 +143,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 self.lastAutoTriedStored.removeAll()
                 self.autoConnectEligible()
             }
-            if state.ready, self.window.isVisible, self.problem == nil, self.authFailedKeys.isEmpty {
+            if state.ready, !self.userOpenedWindow, self.window.isVisible, self.problem == nil, self.authFailedKeys.isEmpty {
                 let anyNeedsPair = self.rows.contains { row in
                     row.session == nil && row.choice != nil && row.choice!.pairedOnly && row.storedPeer == nil
                 }
@@ -199,23 +206,53 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let keptLinks = lastLinks.filter { !snapshot.determines($0) && !snapshot.links.contains($0) }
         let effectiveLinks = (snapshot.links + keptLinks).sorted { $0.name < $1.name }
         let addedPorts = snapshot.activePorts.subtracting(lastActivePorts)
+        let addedConnections = snapshot.activeConnections.subtracting(lastActiveConnections)
         let linksChanged = effectiveLinks != lastLinks
         let portsChanged = snapshot.isCertain && snapshot.activePorts != lastActivePorts
         lastLinks = effectiveLinks
         if snapshot.isCertain {
             lastActivePorts = snapshot.activePorts
+            lastActiveConnections = snapshot.activeConnections
         } else {
             lastActivePorts.formUnion(snapshot.activePorts)
+            lastActiveConnections.formUnion(snapshot.activeConnections)
         }
 
-        if !addedPorts.isEmpty || (linksChanged && !effectiveLinks.isEmpty) {
-            // A cable was plugged in or moved: clear backoff and latches now so the
-            // receiver reconnects at once; forced restart flushes stale mDNS state.
-            cancelAllRetries()
-            reconnectBackoff.resetAll()
-            immediateRetryCause.removeAll()
-            lastAutoTriedCode.removeAll()
-            lastAutoTriedStored.removeAll()
+        let multiPeerSummary = snapshot.multiPeerPorts
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key):active=\($0.value.active),inactive=\($0.value.inactive)" }
+            .joined(separator: " ")
+        if multiPeerSummary != lastMultiPeerDiagnostic {
+            lastMultiPeerDiagnostic = multiPeerSummary
+            if !multiPeerSummary.isEmpty {
+                SenderLog.info("Multiple ThunderboltIP peers sharing one port (\(multiPeerSummary)); connect hosts to separate Mac Thunderbolt ports if traffic stalls")
+            }
+        }
+
+        let topologyAdded = !addedPorts.isEmpty || !addedConnections.isEmpty
+        if topologyAdded || (linksChanged && !effectiveLinks.isEmpty) {
+            // A cable or dock peer was plugged in or moved: clear backoff and latches
+            // for non-active peers so they connect immediately without disturbing
+            // sessions already streaming on another port.
+            for key in Array(retryWorkItems.keys) where sessions[key] == nil {
+                cancelRetry(for: key)
+            }
+            for key in Array(lastAutoTriedCode.keys) where sessions[key] == nil {
+                lastAutoTriedCode.removeValue(forKey: key)
+            }
+            for key in Array(lastAutoTriedStored.keys) where sessions[key] == nil {
+                lastAutoTriedStored.removeValue(forKey: key)
+            }
+            for key in Array(immediateRetryCause.keys) where sessions[key] == nil {
+                immediateRetryCause.removeValue(forKey: key)
+            }
+            if sessions.isEmpty {
+                reconnectBackoff.resetAll()
+            } else {
+                for choice in choices where sessions[choice.peerKey] == nil {
+                    reconnectBackoff.reset(for: choice.peerKey)
+                }
+            }
         } else if snapshot.isCertain && portsChanged && effectiveLinks.isEmpty {
             // Last Thunderbolt link is confirmed gone: forget per-peer latches and
             // manual disconnects so the next replug auto-connects without a Connect press.
@@ -225,11 +262,24 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             lastAutoTriedCode.removeAll()
             lastAutoTriedStored.removeAll()
             sessionErrors.removeAll()
-            manuallyDisconnectedKeys.removeAll()
+            manualDisconnectClearWork?.cancel()
+            manualDisconnectClearWork = nil
+            manualDisconnects.clearAll()
         }
         // Discovery keeps running while sessions are active so additional LOCachy
-        // displays plugged into Thunderbolt/USB4 connect automatically.
-        discovery.update(effectiveLinks, forceRestart: !addedPorts.isEmpty)
+        // displays plugged into Thunderbolt/USB4 connect automatically. When an
+        // additional port or dock peer appears on an already-active bridge0,
+        // refresh DNSServiceBrowse without discarding already-resolved receivers.
+        if linksChanged {
+            discovery.update(effectiveLinks, forceRestart: !effectiveLinks.isEmpty)
+        } else if topologyAdded {
+            discovery.refresh(effectiveLinks)
+        } else {
+            discovery.update(effectiveLinks)
+        }
+        if topologyAdded {
+            autoConnectEligible()
+        }
         render()
     }
 
@@ -287,13 +337,162 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
 
         rebuildRows()
+        reconcileManualDisconnects()
         autoConnectEligible()
+    }
+
+    private func reconcileManualDisconnects() {
+        manualDisconnectClearWork?.cancel()
+        manualDisconnectClearWork = nil
+        guard !manualDisconnects.isEmpty else { return }
+        let presentKeys = Set(choices.map { $0.peerKey }).union(sessions.keys)
+        let hadEntries = !manualDisconnects.isEmpty
+        let nextDelay = manualDisconnects.reconcile(presentKeys: presentKeys, now: ProcessInfo.processInfo.systemUptime)
+        if let nextDelay {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, !self.terminating else { return }
+                self.reconcileManualDisconnects()
+                self.rebuildRows()
+                self.autoConnectEligible()
+            }
+            manualDisconnectClearWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + max(0.2, nextDelay) + 0.05, execute: work)
+        } else if hadEntries {
+            rebuildRows()
+        }
     }
 
     private func showSetupWindow() {
         NSApplication.shared.setActivationPolicy(.regular)
         window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    private func showUserWindow() {
+        userOpenedWindow = true
+        NSApplication.shared.setActivationPolicy(.regular)
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    private func buildStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusMenu.delegate = self
+        item.menu = statusMenu
+        statusItem = item
+        updateStatusItem()
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else { return }
+        let activeCount = sessions.values.filter {
+            if case .active = $0.state { return true }
+            return false
+        }.count
+        let symbolName = activeCount >= 2 ? "display.2" : "display"
+        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "LOCachy Extended Display") {
+            image.isTemplate = true
+            button.image = image
+            button.title = ""
+        } else {
+            button.image = nil
+            button.title = activeCount > 0 ? "LOCachy (\(activeCount))" : "LOCachy"
+        }
+        if activeCount > 0 {
+            let noun = activeCount == 1 ? "display" : "displays"
+            button.toolTip = "LOCachy Extended Display — \(activeCount) \(noun) connected"
+        } else if !sessions.isEmpty {
+            button.toolTip = "LOCachy Extended Display — Connecting…"
+        } else if !choices.isEmpty {
+            button.toolTip = "LOCachy Extended Display — \(choices.count) receiver\(choices.count == 1 ? "" : "s") available"
+        } else {
+            button.toolTip = "LOCachy Extended Display — Waiting for Thunderbolt link"
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === statusMenu else { return }
+        menu.removeAllItems()
+
+        let activeCount = sessions.values.filter {
+            if case .active = $0.state { return true }
+            return false
+        }.count
+        let headerTitle: String
+        if let problem {
+            headerTitle = problem
+        } else if activeCount > 0 {
+            let noun = activeCount == 1 ? "display" : "displays"
+            headerTitle = "\(activeCount) \(noun) connected"
+        } else if !sessions.isEmpty {
+            headerTitle = "Connecting…"
+        } else if !choices.isEmpty {
+            headerTitle = "\(choices.count) receiver\(choices.count == 1 ? "" : "s") on Thunderbolt"
+        } else {
+            headerTitle = "Waiting for Thunderbolt link…"
+        }
+        let header = NSMenuItem(title: headerTitle, action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(NSMenuItem.separator())
+
+        let activeRows = rows.filter { $0.session != nil }
+        for row in activeRows {
+            let name = row.choice?.name ?? row.storedPeer?.displayName ?? row.key
+            let linkText = row.choice.map { " (\($0.link.name))" } ?? ""
+            let item = NSMenuItem(title: "Disconnect \(name)\(linkText)", action: #selector(menuDisconnectPressed(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = row.key
+            if let ejectIcon = NSImage(systemSymbolName: "eject", accessibilityDescription: "Disconnect") {
+                ejectIcon.isTemplate = true
+                item.image = ejectIcon
+            }
+            menu.addItem(item)
+        }
+        if activeRows.count >= 2 {
+            let allItem = NSMenuItem(title: "Disconnect All Displays", action: #selector(menuDisconnectAllPressed), keyEquivalent: "")
+            allItem.target = self
+            if let ejectIcon = NSImage(systemSymbolName: "eject.fill", accessibilityDescription: "Disconnect All") {
+                ejectIcon.isTemplate = true
+                allItem.image = ejectIcon
+            }
+            menu.addItem(allItem)
+        }
+
+        let idleChoices = rows.filter { $0.session == nil && $0.choice != nil }
+        if !activeRows.isEmpty && !idleChoices.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+        for row in idleChoices {
+            guard let choice = row.choice else { continue }
+            let needsPair = choice.pairedOnly && row.storedPeer == nil
+            let title = needsPair ? "Pair \(choice.name)…" : "Connect \(choice.name) (\(choice.link.name))"
+            let action = needsPair ? #selector(pairPressed) : #selector(menuConnectPressed(_:))
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = row.key
+            menu.addItem(item)
+        }
+
+        if !activeRows.isEmpty || !idleChoices.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+
+        let showItem = NSMenuItem(title: "Show Window…", action: #selector(menuShowWindowPressed), keyEquivalent: "")
+        showItem.target = self
+        menu.addItem(showItem)
+
+        let pairItem = NSMenuItem(title: "Pair Receiver Token…", action: #selector(pairPressed), keyEquivalent: "")
+        pairItem.target = self
+        menu.addItem(pairItem)
+
+        let rescanItem = NSMenuItem(title: "Rescan", action: #selector(retryPressed), keyEquivalent: "")
+        rescanItem.target = self
+        menu.addItem(rescanItem)
+
+        menu.addItem(NSMenuItem.separator())
+        let quitItem = NSMenuItem(title: "Quit LOCachy Extended Display", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quitItem)
     }
 
     private func buildWindow() {
@@ -385,12 +584,16 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if discoveryErrorIsPolicy { discovery.restart() }
     }
     func windowDidBecomeKey(_ notification: Notification) { refreshPermissions() }
+    func windowWillClose(_ notification: Notification) {
+        userOpenedWindow = false
+        if !terminating {
+            NSApplication.shared.setActivationPolicy(.accessory)
+        }
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
-            NSApplication.shared.setActivationPolicy(.regular)
-            window.makeKeyAndOrderFront(nil)
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            showUserWindow()
         }
         return true
     }
@@ -400,6 +603,8 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         permissionTimer = nil
         linkLossConfirmWork?.cancel()
         linkLossConfirmWork = nil
+        manualDisconnectClearWork?.cancel()
+        manualDisconnectClearWork = nil
         cancelAllRetries()
         if sessions.isEmpty {
             discovery.stop()
@@ -488,6 +693,9 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         if let choice = item.choice {
             if choice.pairedOnly && item.storedPeer == nil {
                 return "Pairing required — click Pair…"
+            }
+            if manualDisconnects.contains(item.key) {
+                return "Disconnected — click Connect"
             }
             if item.storedPeer != nil {
                 return "Paired — ready"
@@ -635,6 +843,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
         pairButton.isEnabled = true
         retryButton.isEnabled = true
+        updateStatusItem()
     }
 
     // MARK: - Auto-connect & Session Management
@@ -655,7 +864,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             self.retryWorkItems.removeValue(forKey: key)
             guard self.sessions[key] == nil,
                   !self.authFailedKeys.contains(key),
-                  !self.manuallyDisconnectedKeys.contains(key) else { return }
+                  !self.manualDisconnects.contains(key) else { return }
             self.lastAutoTriedCode.removeValue(forKey: key)
             self.lastAutoTriedStored.removeValue(forKey: key)
             self.autoConnectEligible()
@@ -671,7 +880,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let key = choice.peerKey
             guard sessions[key] == nil,
                   !authFailedKeys.contains(key),
-                  !manuallyDisconnectedKeys.contains(key) else { continue }
+                  !manualDisconnects.contains(key) else { continue }
             if !reconnectBackoff.canAttempt(key, now: now) {
                 if retryWorkItems[key] == nil {
                     scheduleRetry(for: key, delay: reconnectBackoff.remainingDelay(for: key, now: now))
@@ -703,7 +912,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         cancelRetry(for: key)
         if !CGPreflightScreenCaptureAccess() { _ = CGRequestScreenCaptureAccess() }
         do {
-            try LinkInterfaces.require(choice.link.name, index: choice.link.index)
+            // Sender.init() enforces LinkInterfaces.require immediately before dialing.
             let identity: String
             let codeText: String
             let usingStored: Bool
@@ -780,7 +989,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 self.discoveryErrorIsPolicy = false
                 self.problem = nil
                 self.rebuildRows()
-                if self.authFailedKeys.isEmpty && PermissionState.current().ready {
+                if !self.userOpenedWindow && self.authFailedKeys.isEmpty && PermissionState.current().ready {
                     self.window.orderOut(nil)
                     NSApplication.shared.setActivationPolicy(.accessory)
                 }
@@ -814,7 +1023,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             rebuildRows()
             // Never leave lastAutoTried* latched when startSession throws before
             // inserting sessions[key]: schedule a backed-off retry and refresh link state.
-            if !terminating && !authFailedKeys.contains(key) && !manuallyDisconnectedKeys.contains(key) {
+            if !terminating && !authFailedKeys.contains(key) && !manualDisconnects.contains(key) {
                 let delay = reconnectBackoff.recordFailure(for: key, now: ProcessInfo.processInfo.systemUptime)
                 scheduleRetry(for: key, delay: delay)
                 watcher.refresh()
@@ -879,7 +1088,8 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
 
         rebuildRows()
-        if !authFailed && !manuallyDisconnectedKeys.contains(key) {
+        reconcileManualDisconnects()
+        if !authFailed && !manualDisconnects.contains(key) {
             let immediateReason = reason == "Receiver advertisement updated"
                 || reason == "Receiver panel changed; reconnect to resize"
                 || reason == "Pairing credential updated"
@@ -925,24 +1135,28 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     // MARK: - Actions
 
-    @objc private func connectPressed() {
-        guard let key = selectedKey, let row = rows.first(where: { $0.key == key }) else { return }
-        if let active = row.session {
-            cancelRetry(for: key)
-            reconnectBackoff.reset(for: key)
-            immediateRetryCause.removeValue(forKey: key)
-            manuallyDisconnectedKeys.insert(key)
-            active.sender.stop()
-            return
-        }
-        guard let choice = row.choice else { return }
+    private func disconnectSession(for key: String) {
+        guard let active = sessions[key] else { return }
         cancelRetry(for: key)
         reconnectBackoff.reset(for: key)
         immediateRetryCause.removeValue(forKey: key)
-        manuallyDisconnectedKeys.remove(key)
+        manualDisconnects.markDisconnected(key)
+        active.sender.stop()
+        rebuildRows()
+    }
+
+    private func connectPeer(for key: String) {
+        guard sessions[key] == nil,
+              let choice = choices.first(where: { $0.peerKey == key }) else { return }
+        cancelRetry(for: key)
+        reconnectBackoff.reset(for: key)
+        immediateRetryCause.removeValue(forKey: key)
+        manualDisconnects.clear(key)
         authFailedKeys.remove(key)
         authFailedCode.removeValue(forKey: key)
         sessionErrors.removeValue(forKey: key)
+        lastAutoTriedCode.removeValue(forKey: key)
+        lastAutoTriedStored.removeValue(forKey: key)
         let stored = choice.hostID.flatMap { peerStore.lookup(hostID: $0) }
         if stored == nil && choice.pairedOnly {
             pairPressed()
@@ -951,7 +1165,37 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         startSession(for: choice, storedPeer: stored, rememberOnActive: false)
     }
 
+    @objc private func menuDisconnectPressed(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        disconnectSession(for: key)
+    }
+
+    @objc private func menuDisconnectAllPressed() {
+        for key in Array(sessions.keys) {
+            disconnectSession(for: key)
+        }
+    }
+
+    @objc private func menuConnectPressed(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        connectPeer(for: key)
+    }
+
+    @objc private func menuShowWindowPressed() {
+        showUserWindow()
+    }
+
+    @objc private func connectPressed() {
+        guard let key = selectedKey, let row = rows.first(where: { $0.key == key }) else { return }
+        if row.session != nil {
+            disconnectSession(for: key)
+            return
+        }
+        connectPeer(for: key)
+    }
+
     @objc private func pairPressed() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Pair LOCachy Receiver"
         alert.informativeText = "Paste the pairing token or URI shown by LOCachy (locachy-pair://v1?… or locachy-pair-v1:…)."
@@ -974,7 +1218,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             immediateRetryCause.removeValue(forKey: peer.hostID)
             authFailedKeys.remove(peer.hostID)
             authFailedCode.removeValue(forKey: peer.hostID)
-            manuallyDisconnectedKeys.remove(peer.hostID)
+            manualDisconnects.clear(peer.hostID)
             sessionErrors.removeValue(forKey: peer.hostID)
             lastAutoTriedStored.removeValue(forKey: peer.hostID)
             lastAutoTriedCode.removeValue(forKey: peer.hostID)
@@ -1022,7 +1266,9 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         discoveryErrorIsPolicy = false
         authFailedKeys.removeAll()
         authFailedCode.removeAll()
-        manuallyDisconnectedKeys.removeAll()
+        manualDisconnectClearWork?.cancel()
+        manualDisconnectClearWork = nil
+        manualDisconnects.clearAll()
         sessionErrors.removeAll()
         lastAutoTriedCode.removeAll()
         lastAutoTriedStored.removeAll()

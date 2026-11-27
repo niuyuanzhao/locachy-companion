@@ -58,6 +58,69 @@ private final class DisplaySetupGate {
 }
 
 @available(macOS 14.0, *)
+@MainActor
+private final class VirtualDisplayCoordinator {
+    static let shared = VirtualDisplayCoordinator()
+    private var policy = VirtualDisplayResetPolicy()
+    private var sessions: [ObjectIdentifier: CaptureSession] = [:]
+
+    func register(_ session: CaptureSession) {
+        let token = ObjectIdentifier(session)
+        sessions[token] = session
+        policy.recordAttach(token)
+    }
+
+    func unregister(_ session: CaptureSession) {
+        let token = ObjectIdentifier(session)
+        sessions.removeValue(forKey: token)
+        policy.recordDetach(token)
+    }
+
+    // Must be called while holding DisplaySetupGate.shared. Runs inside an
+    // uncancelled MainActor task so cancellation of the newly arriving session
+    // never leaves existing live sessions half-suspended.
+    func suspendAllIfNeeded() async -> [CaptureSession] {
+        guard policy.shouldResetBeforeAttach else { return [] }
+        let live = Array(sessions.values).filter { !$0.isStopped }
+        guard !live.isEmpty else {
+            policy.recordResetDrained()
+            return []
+        }
+        return await Task { @MainActor in
+            SenderLog.info("Resetting \(live.count) active virtual display(s) before attaching another to avoid ScreenCaptureKit stream confusion (FB17797423)")
+            var suspendedIDs: [CGDirectDisplayID] = []
+            for session in live {
+                if let oldID = await session.suspendForReset() {
+                    suspendedIDs.append(oldID)
+                }
+                self.sessions.removeValue(forKey: ObjectIdentifier(session))
+            }
+            self.policy.recordResetDrained()
+            await Self.waitUntilOffline(suspendedIDs)
+            try? await Task.sleep(for: .milliseconds(150))
+            return live.filter { !$0.isStopped }
+        }.value
+    }
+
+    private static func waitUntilOffline(_ targets: [CGDirectDisplayID]) async {
+        guard !targets.isEmpty else { return }
+        let targetSet = Set(targets)
+        for _ in 0..<30 {
+            var count: UInt32 = 0
+            CGGetOnlineDisplayList(0, nil, &count)
+            var online = [CGDirectDisplayID](repeating: 0, count: Int(count))
+            if count > 0 {
+                CGGetOnlineDisplayList(count, &online, &count)
+            }
+            if targetSet.isDisjoint(with: online.prefix(Int(count))) {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+}
+
+@available(macOS 14.0, *)
 final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let transport: SecureTransport
     private let panel: Panel
@@ -68,6 +131,12 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private let lock = NSLock()
     private var display: VirtualDisplay?
     private var claimedSerialNum: UInt32?
+    private var displayPlan: VirtualCanvasPlan?
+    private var allowedModes: [CGVirtualDisplayMode] = []
+    private var allowedPointSizes: [(Int, Int)] = []
+    private var displayMillimeters: CGSize = .zero
+    private var preferredIdentity: VirtualDisplayIdentity?
+    private var lastActiveMode: SavedDisplayMode?
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
     private var input: RemoteInput?
@@ -77,6 +146,11 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var pendingImage: CVImageBuffer?
     private var pendingPts: CMTime = .invalid
     private var stopped = false
+    var isStopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
     private var needsKeyframe = true
     private var encoding = false
     private var lastSubmit = 0.0
@@ -89,6 +163,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private let logPeriodicStats = ProcessInfo.processInfo.environment["LOCACHY_STATS"] == "1"
     private var activeCodec = "h264"
     private var recovering = false
+    private var resetting = false
     private var captureWidth = 0
     private var captureHeight = 0
     private var sleepAssertion: IOPMAssertionID = 0
@@ -141,6 +216,291 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
+    @MainActor
+    private func createAndConfigureVirtualDisplay(
+        plan: VirtualCanvasPlan,
+        allowedModes: [CGVirtualDisplayMode],
+        allowedPointSizes: [(Int, Int)],
+        millimeters: CGSize,
+        preferredIdentity: VirtualDisplayIdentity,
+        preferredModeOverride: SavedDisplayMode?,
+        checkCancellation: Bool
+    ) async throws -> (CGDirectDisplayID, SavedDisplayMode) {
+        let first = plan.bootstrap
+        let initialModes: [CGVirtualDisplayMode]? = (plan.requested == first) ? allowedModes : nil
+        let claimed = ActiveDisplayRegistry.shared.claim(preferred: preferredIdentity)
+        claimedSerialNum = claimed.serialNum
+        do {
+            if checkCancellation { try Task.checkCancellation() }
+            var createdDisplay: VirtualDisplay?
+            var activeSerial = claimed.serialNum
+            for probe: UInt32 in 0..<8 {
+                if checkCancellation { try Task.checkCancellation() }
+                let probeSerial: UInt32
+                let probeProduct: UInt32
+                if probe == 0 {
+                    probeSerial = claimed.serialNum
+                    probeProduct = claimed.productID
+                } else {
+                    let bumped = ActiveDisplayRegistry.shared.claim(
+                        preferred: VirtualDisplayIdentity(
+                            name: claimed.name,
+                            serialNum: ((claimed.serialNum &+ probe) & 0x7FFF_FFFF) == 0 ? 1 : ((claimed.serialNum &+ probe) & 0x7FFF_FFFF),
+                            productID: 0x4C00 | ((claimed.productID &+ probe) & 0x00FF)
+                        )
+                    )
+                    ActiveDisplayRegistry.shared.release(serialNum: activeSerial)
+                    activeSerial = bumped.serialNum
+                    self.claimedSerialNum = activeSerial
+                    probeSerial = bumped.serialNum
+                    probeProduct = bumped.productID
+                }
+                if let candidate = VirtualDisplay(
+                    name: claimed.name, pointsWide: first.pointsWide, pointsHigh: first.pointsHigh,
+                    scale: first.scale, descriptorMaxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis,
+                    sizeInMillimeters: millimeters, serialNum: probeSerial, productID: probeProduct,
+                    modes: initialModes
+                ) {
+                    createdDisplay = candidate
+                    break
+                }
+                if checkCancellation {
+                    try await Task.sleep(for: .milliseconds(100))
+                } else {
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            }
+            guard let created = createdDisplay else {
+                throw SenderError("CGVirtualDisplay is unavailable or rejected this mode")
+            }
+            self.display = created
+            let displayID = created.displayID
+            if plan.requested != first {
+                guard await created.resize(pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
+                                           scale: plan.requested.scale, modes: allowedModes, movingTo: nil) else {
+                    throw SenderError("macOS rejected the receiver resolution")
+                }
+            }
+            let defaultTarget: SavedDisplayMode
+            let exactHiDPI = (panel.width / 2, panel.height / 2)
+            let native1x = (panel.width & ~1, panel.height & ~1)
+            if panel.scale == 2, min(panel.width, panel.height) >= 1296,
+               allowedPointSizes.contains(where: { $0.0 == exactHiDPI.0 && $0.1 == exactHiDPI.1 }) {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: exactHiDPI.0, pointsHigh: exactHiDPI.1,
+                    pixelsWide: exactHiDPI.0 * 2, pixelsHigh: exactHiDPI.1 * 2)
+            } else if allowedPointSizes.contains(where: { $0.0 == native1x.0 && $0.1 == native1x.1 }) {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: native1x.0, pointsHigh: native1x.1,
+                    pixelsWide: native1x.0, pixelsHigh: native1x.1)
+            } else if let closest = allowedPointSizes.min(by: {
+                abs($0.1 - panel.height) + abs($0.0 - panel.width) < abs($1.1 - panel.height) + abs($1.0 - panel.width)
+            }) {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: closest.0, pointsHigh: closest.1,
+                    pixelsWide: closest.0 * panel.scale, pixelsHigh: closest.1 * panel.scale)
+            } else {
+                defaultTarget = SavedDisplayMode(
+                    pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
+                    pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
+            }
+            var targetMode = preferredModeOverride
+                ?? DisplayModeDB.shared.lookup(for: panel, allowedPointSizes: allowedPointSizes)
+                ?? defaultTarget
+            for _ in 0..<20 {
+                if checkCancellation { try Task.checkCancellation() }
+                self.selectNativeMode(id: displayID, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
+                                      pixelsWide: targetMode.pixelsWide, pixelsHigh: targetMode.pixelsHigh)
+                if let cur = CGDisplayCopyDisplayMode(displayID),
+                   cur.width == targetMode.pointsWide, cur.height == targetMode.pointsHigh,
+                   (cur.pixelWidth == targetMode.pixelsWide && cur.pixelHeight == targetMode.pixelsHigh
+                    || targetMode.pointsWide == panel.width) {
+                    break
+                }
+                if checkCancellation {
+                    try await Task.sleep(for: .milliseconds(50))
+                } else {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+            }
+            if let cur = CGDisplayCopyDisplayMode(displayID),
+               cur.width != targetMode.pointsWide || cur.height != targetMode.pointsHigh,
+               targetMode != defaultTarget {
+                targetMode = defaultTarget
+                for _ in 0..<20 {
+                    if checkCancellation { try Task.checkCancellation() }
+                    self.selectNativeMode(id: displayID, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
+                                          pixelsWide: targetMode.pixelsWide, pixelsHigh: targetMode.pixelsHigh)
+                    if let updated = CGDisplayCopyDisplayMode(displayID),
+                       updated.width == targetMode.pointsWide, updated.height == targetMode.pointsHigh {
+                        break
+                    }
+                    if checkCancellation {
+                        try await Task.sleep(for: .milliseconds(50))
+                    } else {
+                        try? await Task.sleep(for: .milliseconds(50))
+                    }
+                }
+            }
+            guard CGDisplayIsInMirrorSet(displayID) != 1 else {
+                throw SenderError("macOS placed the LOCachy display in a mirror set")
+            }
+            guard let cur = CGDisplayCopyDisplayMode(displayID),
+                  cur.width > 0, cur.height > 0, cur.pixelWidth > 0, cur.pixelHeight > 0 else {
+                throw SenderError("Virtual display did not enter the requested display mode")
+            }
+            if cur.width != targetMode.pointsWide || cur.height != targetMode.pointsHigh {
+                // Accept another valid mode from our advertised list instead of
+                // discarding the virtual display and thrashing WindowServer.
+                guard allowedPointSizes.contains(where: { $0.0 == cur.width && $0.1 == cur.height }) else {
+                    throw SenderError("Virtual display did not enter the requested display mode")
+                }
+                SenderLog.info("Virtual display \(displayID) settled at \(cur.width)x\(cur.height) (px=\(cur.pixelWidth)x\(cur.pixelHeight)) instead of \(targetMode.pointsWide)x\(targetMode.pointsHigh); proceeding")
+            }
+            return (displayID, SavedDisplayMode(
+                pointsWide: cur.width, pointsHigh: cur.height,
+                pixelsWide: cur.pixelWidth, pixelsHigh: cur.pixelHeight))
+        } catch {
+            // Release the partially configured virtual display and serial inside
+            // DisplaySetupGate so WindowServer never overlaps teardown with a retry.
+            self.display = nil
+            if let serial = self.claimedSerialNum {
+                ActiveDisplayRegistry.shared.release(serialNum: serial)
+                self.claimedSerialNum = nil
+            }
+            throw error
+        }
+    }
+
+    @MainActor
+    func suspendForReset() async -> CGDirectDisplayID? {
+        guard !isStopped else { return nil }
+        resetting = true
+        let oldID = display?.displayID
+        if let oldID, let cur = CGDisplayCopyDisplayMode(oldID),
+           cur.width > 0, cur.height > 0, cur.pixelWidth > 0, cur.pixelHeight > 0 {
+            lastActiveMode = SavedDisplayMode(
+                pointsWide: cur.width, pointsHigh: cur.height,
+                pixelsWide: cur.pixelWidth, pixelsHigh: cur.pixelHeight
+            )
+        }
+        modeTask?.cancel(); modeTask = nil
+        if reconfigRegistered, let ctx = reconfigContext {
+            CGDisplayRemoveReconfigurationCallback(Self.displayReconfigurationCallback, ctx)
+            reconfigRegistered = false
+            reconfigContext = nil
+        }
+        if let activeStream = stream {
+            stream = nil
+            try? activeStream.removeStreamOutput(self, type: .screen)
+            try? await activeStream.stopCapture()
+        }
+        sampleQueue.sync {
+            self.refineTimer?.cancel()
+            self.refineTimer = nil
+        }
+        lock.withLock {
+            pendingImage = nil
+            pendingPts = .invalid
+        }
+        display = nil
+        if let serial = claimedSerialNum {
+            ActiveDisplayRegistry.shared.release(serialNum: serial)
+            claimedSerialNum = nil
+        }
+        return oldID
+    }
+
+    @MainActor
+    func recreateDisplayForReset() async -> (CGDirectDisplayID, SavedDisplayMode)? {
+        guard !isStopped,
+              let plan = displayPlan,
+              let preferred = preferredIdentity else {
+            resetting = false
+            return nil
+        }
+        do {
+            let (id, mode) = try await createAndConfigureVirtualDisplay(
+                plan: plan,
+                allowedModes: allowedModes,
+                allowedPointSizes: allowedPointSizes,
+                millimeters: displayMillimeters,
+                preferredIdentity: preferred,
+                preferredModeOverride: lastActiveMode,
+                checkCancellation: false
+            )
+            if isStopped {
+                display = nil
+                if let serial = claimedSerialNum {
+                    ActiveDisplayRegistry.shared.release(serialNum: serial)
+                    claimedSerialNum = nil
+                }
+                resetting = false
+                return nil
+            }
+            lastActiveMode = mode
+            VirtualDisplayCoordinator.shared.register(self)
+            return (id, mode)
+        } catch {
+            resetting = false
+            if !isStopped {
+                SenderLog.info("Virtual display reset failed for \(preferred.name): \(error)")
+                transport.stop("Virtual display reset failed: \(error)")
+            }
+            return nil
+        }
+    }
+
+    @MainActor
+    func restartCaptureAfterReset(id: CGDirectDisplayID, activeMode: SavedDisplayMode) async {
+        defer { resetting = false }
+        guard !isStopped else {
+            display = nil
+            if let serial = claimedSerialNum {
+                ActiveDisplayRegistry.shared.release(serialNum: serial)
+                claimedSerialNum = nil
+            }
+            VirtualDisplayCoordinator.shared.unregister(self)
+            return
+        }
+        do {
+            let capW = activeMode.pixelsWide, capH = activeMode.pixelsHigh
+            captureWidth = capW
+            captureHeight = capH
+            let target = try await shareable(id, checkCancellation: false)
+            guard !isStopped else { return }
+            updateScrollScale(displayID: id)
+            inputQueue.sync { self.input?.updateDisplayID(id) }
+            let ctx = Unmanaged.passUnretained(self).toOpaque()
+            if !reconfigRegistered,
+               CGDisplayRegisterReconfigurationCallback(Self.displayReconfigurationCallback, ctx) == .success {
+                reconfigContext = ctx
+                reconfigRegistered = true
+            }
+            let filter = SCContentFilter(display: target, excludingWindows: [])
+            let configuration = makeStreamConfiguration(width: capW, height: capH)
+            let capture = SCStream(filter: filter, configuration: configuration, delegate: self)
+            try capture.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
+            stream = capture
+            requestKeyframe()
+            try await capture.startCapture()
+            guard !isStopped else {
+                stream = nil
+                try? capture.removeStreamOutput(self, type: .screen)
+                try? await capture.stopCapture()
+                return
+            }
+            startModeWatcher(id: id, initialTarget: activeMode, allowedPointSizes: allowedPointSizes)
+            let serialHex = String(format: "0x%08x", claimedSerialNum ?? preferredIdentity?.serialNum ?? 0)
+            SenderLog.info("Extended display \(id) (\(preferredIdentity?.name ?? panel.displayLabel), serial=\(serialHex)) resumed after virtual-display reset at \(activeMode.pointsWide)x\(activeMode.pointsHigh) (cap=\(capW)x\(capH))")
+        } catch {
+            if !isStopped {
+                SenderLog.info("Capture restart after virtual-display reset failed: \(error)")
+                transport.stop("Capture restart after virtual-display reset failed: \(error)")
+            }
+        }
+    }
+
     // Main actor: CGVirtualDisplay installs its WindowServer callbacks on main.
     @MainActor
     func start() async throws {
@@ -161,189 +521,130 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             }
             guard let plan = VirtualCanvasSizing.plan(pixelsWide: panel.width, pixelsHigh: panel.height, scale: panel.scale)
             else { throw SenderError("Receiver panel dimensions are unsupported") }
-            let first = plan.bootstrap
-            let allowedModes = VirtualDisplay.scaledModes(
+            let modes = VirtualDisplay.scaledModes(
                 panelWide: panel.width, panelHigh: panel.height,
                 scale: plan.requested.scale, maxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis)
-            let allowedPointSizes = allowedModes.map { (Int($0.width), Int($0.height)) }
-            let millimeters = VirtualDisplay.syntheticMillimeters(for: allowedModes)
-            let initialModes: [CGVirtualDisplayMode]? = (plan.requested == first) ? allowedModes : nil
-            let preferredIdentity = VirtualDisplayIdentity.derive(from: panel, hostIDOverride: hostIDOverride)
-            let claimed = ActiveDisplayRegistry.shared.claim(preferred: preferredIdentity)
-            claimedSerialNum = claimed.serialNum
+            let pointSizes = modes.map { (Int($0.width), Int($0.height)) }
+            let millimeters = VirtualDisplay.syntheticMillimeters(for: modes)
+            let preferred = VirtualDisplayIdentity.derive(from: panel, hostIDOverride: hostIDOverride)
+            self.displayPlan = plan
+            self.allowedModes = modes
+            self.allowedPointSizes = pointSizes
+            self.displayMillimeters = millimeters
+            self.preferredIdentity = preferred
+
             let (id, activeMode): (CGDirectDisplayID, SavedDisplayMode) = try await DisplaySetupGate.shared.withLock {
+                // If another virtual display is already active, drain all virtual
+                // displays to zero and recreate every CGVirtualDisplay before
+                // starting any SCStream so ScreenCaptureKit maps each stream to
+                // its own framebuffer (FB17797423).
+                let suspended = await VirtualDisplayCoordinator.shared.suspendAllIfNeeded()
+                let recreated: [(CaptureSession, CGDirectDisplayID, SavedDisplayMode)] = await Task { @MainActor in
+                    var out: [(CaptureSession, CGDirectDisplayID, SavedDisplayMode)] = []
+                    for session in suspended {
+                        if let pair = await session.recreateDisplayForReset() {
+                            out.append((session, pair.0, pair.1))
+                        }
+                    }
+                    return out
+                }.value
+
+                func resumeRecreated() async {
+                    guard !recreated.isEmpty else { return }
+                    await Task { @MainActor in
+                        for (session, resumedID, resumedMode) in recreated {
+                            await session.restartCaptureAfterReset(id: resumedID, activeMode: resumedMode)
+                        }
+                    }.value
+                }
+
+                let ownID: CGDirectDisplayID
+                let ownMode: SavedDisplayMode
                 do {
                     try Task.checkCancellation()
-                    var createdDisplay: VirtualDisplay?
-                    var activeSerial = claimed.serialNum
-                    for probe: UInt32 in 0..<8 {
-                        try Task.checkCancellation()
-                        let probeSerial: UInt32
-                        let probeProduct: UInt32
-                        if probe == 0 {
-                            probeSerial = claimed.serialNum
-                            probeProduct = claimed.productID
-                        } else {
-                            let bumped = ActiveDisplayRegistry.shared.claim(
-                                preferred: VirtualDisplayIdentity(
-                                    name: claimed.name,
-                                    serialNum: ((claimed.serialNum &+ probe) & 0x7FFF_FFFF) == 0 ? 1 : ((claimed.serialNum &+ probe) & 0x7FFF_FFFF),
-                                    productID: 0x4C00 | ((claimed.productID &+ probe) & 0x00FF)
-                                )
-                            )
-                            ActiveDisplayRegistry.shared.release(serialNum: activeSerial)
-                            activeSerial = bumped.serialNum
-                            self.claimedSerialNum = activeSerial
-                            probeSerial = bumped.serialNum
-                            probeProduct = bumped.productID
-                        }
-                        if let candidate = VirtualDisplay(
-                            name: claimed.name, pointsWide: first.pointsWide, pointsHigh: first.pointsHigh,
-                            scale: first.scale, descriptorMaxPixelsPerAxis: plan.descriptorMaxPixelsPerAxis,
-                            sizeInMillimeters: millimeters, serialNum: probeSerial, productID: probeProduct,
-                            modes: initialModes
-                        ) {
-                            createdDisplay = candidate
-                            break
-                        }
-                        try await Task.sleep(for: .milliseconds(100))
-                    }
-                    guard let created = createdDisplay else {
-                        throw SenderError("CGVirtualDisplay is unavailable or rejected this mode")
-                    }
-                    self.display = created
-                    let displayID = created.displayID
-                    if plan.requested != first {
-                        guard await created.resize(pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
-                                                   scale: plan.requested.scale, modes: allowedModes, movingTo: nil) else {
-                            throw SenderError("macOS rejected the receiver resolution")
-                        }
-                    }
-                    let defaultTarget: SavedDisplayMode
-                    let exactHiDPI = (panel.width / 2, panel.height / 2)
-                    let native1x = (panel.width & ~1, panel.height & ~1)
-                    if panel.scale == 2, min(panel.width, panel.height) >= 1296,
-                       allowedPointSizes.contains(where: { $0.0 == exactHiDPI.0 && $0.1 == exactHiDPI.1 }) {
-                        defaultTarget = SavedDisplayMode(
-                            pointsWide: exactHiDPI.0, pointsHigh: exactHiDPI.1,
-                            pixelsWide: exactHiDPI.0 * 2, pixelsHigh: exactHiDPI.1 * 2)
-                    } else if allowedPointSizes.contains(where: { $0.0 == native1x.0 && $0.1 == native1x.1 }) {
-                        defaultTarget = SavedDisplayMode(
-                            pointsWide: native1x.0, pointsHigh: native1x.1,
-                            pixelsWide: native1x.0, pixelsHigh: native1x.1)
-                    } else if let closest = allowedPointSizes.min(by: {
-                        abs($0.1 - panel.height) + abs($0.0 - panel.width) < abs($1.1 - panel.height) + abs($1.0 - panel.width)
-                    }) {
-                        defaultTarget = SavedDisplayMode(
-                            pointsWide: closest.0, pointsHigh: closest.1,
-                            pixelsWide: closest.0 * panel.scale, pixelsHigh: closest.1 * panel.scale)
-                    } else {
-                        defaultTarget = SavedDisplayMode(
-                            pointsWide: plan.requested.pointsWide, pointsHigh: plan.requested.pointsHigh,
-                            pixelsWide: plan.requested.pixelsWide, pixelsHigh: plan.requested.pixelsHigh)
-                    }
-                    var targetMode = DisplayModeDB.shared.lookup(for: panel, allowedPointSizes: allowedPointSizes) ?? defaultTarget
-                    for _ in 0..<20 {
-                        try Task.checkCancellation()
-                        self.selectNativeMode(id: displayID, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
-                                              pixelsWide: targetMode.pixelsWide, pixelsHigh: targetMode.pixelsHigh)
-                        if let cur = CGDisplayCopyDisplayMode(displayID),
-                           cur.width == targetMode.pointsWide, cur.height == targetMode.pointsHigh,
-                           (cur.pixelWidth == targetMode.pixelsWide && cur.pixelHeight == targetMode.pixelsHigh
-                            || targetMode.pointsWide == panel.width) {
-                            break
-                        }
-                        try await Task.sleep(for: .milliseconds(50))
-                    }
-                    if let cur = CGDisplayCopyDisplayMode(displayID),
-                       cur.width != targetMode.pointsWide || cur.height != targetMode.pointsHigh,
-                       targetMode != defaultTarget {
-                        targetMode = defaultTarget
-                        for _ in 0..<20 {
-                            try Task.checkCancellation()
-                            self.selectNativeMode(id: displayID, pointsWide: targetMode.pointsWide, pointsHigh: targetMode.pointsHigh,
-                                                  pixelsWide: targetMode.pixelsWide, pixelsHigh: targetMode.pixelsHigh)
-                            if let updated = CGDisplayCopyDisplayMode(displayID),
-                               updated.width == targetMode.pointsWide, updated.height == targetMode.pointsHigh {
-                                break
-                            }
-                            try await Task.sleep(for: .milliseconds(50))
-                        }
-                    }
-                    guard CGDisplayIsInMirrorSet(displayID) != 1 else {
-                        throw SenderError("macOS placed the LOCachy display in a mirror set")
-                    }
-                    guard let cur = CGDisplayCopyDisplayMode(displayID),
-                          cur.width > 0, cur.height > 0, cur.pixelWidth > 0, cur.pixelHeight > 0 else {
-                        throw SenderError("Virtual display did not enter the requested display mode")
-                    }
-                    if cur.width != targetMode.pointsWide || cur.height != targetMode.pointsHigh {
-                        // Accept another valid mode from our advertised list instead of
-                        // discarding the virtual display and thrashing WindowServer.
-                        guard allowedPointSizes.contains(where: { $0.0 == cur.width && $0.1 == cur.height }) else {
-                            throw SenderError("Virtual display did not enter the requested display mode")
-                        }
-                        SenderLog.info("Virtual display \(displayID) settled at \(cur.width)x\(cur.height) (px=\(cur.pixelWidth)x\(cur.pixelHeight)) instead of \(targetMode.pointsWide)x\(targetMode.pointsHigh); proceeding")
-                    }
-                    return (displayID, SavedDisplayMode(
-                        pointsWide: cur.width, pointsHigh: cur.height,
-                        pixelsWide: cur.pixelWidth, pixelsHigh: cur.pixelHeight))
+                    let pair = try await self.createAndConfigureVirtualDisplay(
+                        plan: plan,
+                        allowedModes: modes,
+                        allowedPointSizes: pointSizes,
+                        millimeters: millimeters,
+                        preferredIdentity: preferred,
+                        preferredModeOverride: nil,
+                        checkCancellation: true
+                    )
+                    ownID = pair.0
+                    ownMode = pair.1
+                    self.lastActiveMode = ownMode
+                    VirtualDisplayCoordinator.shared.register(self)
                 } catch {
-                    // Release the partially configured virtual display and serial inside
-                    // DisplaySetupGate so WindowServer never overlaps teardown with a retry.
+                    await resumeRecreated()
+                    throw error
+                }
+
+                // All CGVirtualDisplays are now attached; start all SCStreams.
+                await resumeRecreated()
+
+                do {
+                    let width = self.panel.width, height = self.panel.height
+                    let capW = ownMode.pixelsWide, capH = ownMode.pixelsHigh
+                    self.captureWidth = capW
+                    self.captureHeight = capH
+                    let target = try await self.shareable(ownID)
+                    try Task.checkCancellation()
+                    try self.configureEncoder(width: width, height: height)
+                    self.updateScrollScale(displayID: ownID)
+                    let remoteInput = RemoteInput(
+                        displayID: ownID,
+                        coordinator: self.inputCoordinator,
+                        capsSyncNegotiated: self.capsSyncNegotiated
+                    )
+                    self.inputQueue.sync { self.input = remoteInput }
+                    let ctx = Unmanaged.passUnretained(self).toOpaque()
+                    if CGDisplayRegisterReconfigurationCallback(Self.displayReconfigurationCallback, ctx) == .success {
+                        self.reconfigContext = ctx
+                        self.reconfigRegistered = true
+                    }
+                    self.transport.onVideoDrained = { [weak self] in
+                        self?.sampleQueue.async { [weak self] in
+                            self?.drainPendingFrame(forceAdmission: true)
+                        }
+                    }
+                    let filter = SCContentFilter(display: target, excludingWindows: [])
+                    let configuration = self.makeStreamConfiguration(width: capW, height: capH)
+                    let capture = SCStream(filter: filter, configuration: configuration, delegate: self)
+                    try capture.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.sampleQueue)
+                    self.stream = capture
+                    // Snapshot first: the receiver accepts capsLockState right after welcome, and
+                    // every later Mac change is broadcast through the same ordered transport.
+                    if self.capsSyncNegotiated {
+                        self.inputCoordinator.registerCapsLockSubscriber(sessionID: remoteInput.sessionID) { [weak self] state in
+                            self?.transport.sendObject(["type": "capsLockState", Wire.capsLockStateField: state])
+                        }
+                    }
+                    self.transport.sendObject(["type": "streamConfig", "codec": self.activeCodec, "width": width,
+                                               "height": height, "framesPerSecond": self.panel.fps])
+                    try await capture.startCapture()
+                    try Task.checkCancellation()
+                    return (ownID, ownMode)
+                } catch {
+                    if let activeStream = self.stream {
+                        self.stream = nil
+                        try? activeStream.removeStreamOutput(self, type: .screen)
+                        try? await activeStream.stopCapture()
+                    }
                     self.display = nil
                     if let serial = self.claimedSerialNum {
                         ActiveDisplayRegistry.shared.release(serialNum: serial)
                         self.claimedSerialNum = nil
                     }
+                    VirtualDisplayCoordinator.shared.unregister(self)
                     throw error
                 }
             }
-            let width = panel.width, height = panel.height
-            let capW = activeMode.pixelsWide, capH = activeMode.pixelsHigh
-            captureWidth = capW
-            captureHeight = capH
-            let target = try await shareable(id)
-            try Task.checkCancellation()
-            try configureEncoder(width: width, height: height)
-            updateScrollScale(displayID: id)
-            let remoteInput = RemoteInput(
-                displayID: id,
-                coordinator: inputCoordinator,
-                capsSyncNegotiated: capsSyncNegotiated
-            )
-            inputQueue.sync { self.input = remoteInput }
-            let ctx = Unmanaged.passUnretained(self).toOpaque()
-            if CGDisplayRegisterReconfigurationCallback(Self.displayReconfigurationCallback, ctx) == .success {
-                reconfigContext = ctx
-                reconfigRegistered = true
-            }
-            transport.onVideoDrained = { [weak self] in
-                self?.sampleQueue.async { [weak self] in
-                    self?.drainPendingFrame(forceAdmission: true)
-                }
-            }
-            let filter = SCContentFilter(display: target, excludingWindows: [])
-            let configuration = makeStreamConfiguration(width: capW, height: capH)
-            let capture = SCStream(filter: filter, configuration: configuration, delegate: self)
-            try capture.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
-            stream = capture
-            // Snapshot first: the receiver accepts capsLockState right after welcome, and
-            // every later Mac change is broadcast through the same ordered transport.
-            if capsSyncNegotiated {
-                inputCoordinator.registerCapsLockSubscriber(sessionID: remoteInput.sessionID) { [weak self] state in
-                    self?.transport.sendObject(["type": "capsLockState", Wire.capsLockStateField: state])
-                }
-            }
-            transport.sendObject(["type": "streamConfig", "codec": activeCodec, "width": width,
-                                  "height": height, "framesPerSecond": panel.fps])
-            try await capture.startCapture()
-            try Task.checkCancellation()
-            startModeWatcher(id: id, initialTarget: activeMode, allowedPointSizes: allowedPointSizes)
-            let serialHex = String(format: "0x%08x", claimedSerialNum ?? claimed.serialNum)
-            SenderLog.info("Extended display \(id) (\(claimed.name), serial=\(serialHex)) is active at \(activeMode.pointsWide)x\(activeMode.pointsHigh) (cap=\(capW)x\(capH), out=\(width)x\(height), \(activeCodec), \(panel.identityKey))")
+            startModeWatcher(id: id, initialTarget: activeMode, allowedPointSizes: pointSizes)
+            let serialHex = String(format: "0x%08x", claimedSerialNum ?? preferred.serialNum)
+            SenderLog.info("Extended display \(id) (\(preferred.name), serial=\(serialHex)) is active at \(activeMode.pointsWide)x\(activeMode.pointsHigh) (cap=\(activeMode.pixelsWide)x\(activeMode.pixelsHigh), out=\(panel.width)x\(panel.height), \(activeCodec), \(panel.identityKey))")
         } catch {
-            stop("Capture setup failed: \(error)")
+            await stopAsync("Capture setup failed: \(error)")
             throw error
         }
     }
@@ -400,18 +701,18 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     @MainActor
     private func rebuildStream(id: CGDirectDisplayID, sourceWidth: Int, sourceHeight: Int) async -> RebuildResult {
-        guard !stopped, !recovering else { return .skipped }
+        guard !stopped, !recovering, !resetting else { return .skipped }
         recovering = true
         defer { recovering = false }
         try? await Task.sleep(for: .milliseconds(60))
-        guard !stopped else { return .skipped }
+        guard !stopped, !resetting else { return .skipped }
         let updated: SCDisplay
         do {
             updated = try await shareable(id)
         } catch {
-            return stopped ? .skipped : .failed(error)
+            return (stopped || resetting) ? .skipped : .failed(error)
         }
-        guard !stopped else { return .skipped }
+        guard !stopped, !resetting else { return .skipped }
         captureWidth = sourceWidth
         captureHeight = sourceHeight
         let cfg = makeStreamConfiguration(width: sourceWidth, height: sourceHeight)
@@ -421,12 +722,12 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 try await active.updateContentFilter(filter)
                 try await active.updateConfiguration(cfg)
                 requestKeyframe()
-                return stopped ? .skipped : .succeeded
+                return (stopped || resetting) ? .skipped : .succeeded
             } catch {
                 // Fall through to full SCStream replacement if in-place update fails.
             }
         }
-        guard !stopped else { return .skipped }
+        guard !stopped, !resetting else { return .skipped }
         let oldStream = stream
         let replacement = SCStream(filter: filter, configuration: cfg, delegate: self)
         do {
@@ -434,7 +735,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             stream = replacement
             requestKeyframe()
             try await replacement.startCapture()
-            if stopped {
+            if stopped || resetting {
                 try? replacement.removeStreamOutput(self, type: .screen)
                 try? await replacement.stopCapture()
                 if let oldStream, oldStream !== replacement {
@@ -450,7 +751,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             }
             return .succeeded
         } catch {
-            if stopped {
+            if stopped || resetting {
                 if let oldStream, oldStream !== replacement {
                     try? oldStream.removeStreamOutput(self, type: .screen)
                     try? await oldStream.stopCapture()
@@ -467,7 +768,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     @MainActor
     private func recoverStream() async {
         try? await Task.sleep(for: .milliseconds(150))
-        guard !stopped, let display else { return }
+        guard !stopped, !resetting, let display else { return }
         let m = CGDisplayCopyDisplayMode(display.displayID)
         if case .failed(let error) = await rebuildStream(id: display.displayID,
                                                          sourceWidth: m?.pixelWidth ?? panel.width,
@@ -489,7 +790,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         modeTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
-                guard let self, !self.stopped,
+                guard let self, !self.stopped, !self.resetting,
                       var m = CGDisplayCopyDisplayMode(id) else { continue }
                 let now = ProcessInfo.processInfo.systemUptime
                 if now < settleUntil {
@@ -498,6 +799,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                         (m.pixelWidth != initialTarget.pixelsWide || m.pixelHeight != initialTarget.pixelsHigh)) {
                         correctedDuringSettle = true
                         await DisplaySetupGate.shared.run {
+                            guard !Task.isCancelled, !self.stopped, !self.resetting else { return }
                             self.selectNativeMode(id: id, pointsWide: initialTarget.pointsWide, pointsHigh: initialTarget.pointsHigh,
                                                   pixelsWide: initialTarget.pixelsWide, pixelsHigh: initialTarget.pixelsHigh)
                         }
@@ -534,6 +836,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     if !tried1xPanel {
                         tried1xPanel = true
                         await DisplaySetupGate.shared.run {
+                            guard !Task.isCancelled, !self.stopped, !self.resetting else { return }
                             self.selectNativeMode(id: id, pointsWide: self.panel.width, pointsHigh: self.panel.height,
                                                   pixelsWide: self.panel.width, pixelsHigh: self.panel.height)
                         }
@@ -580,14 +883,18 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     @MainActor
-    private func shareable(_ id: CGDirectDisplayID) async throws -> SCDisplay {
+    private func shareable(_ id: CGDirectDisplayID, checkCancellation: Bool = true) async throws -> SCDisplay {
         for _ in 0..<40 {
-            try Task.checkCancellation()
+            if checkCancellation { try Task.checkCancellation() }
             let displays = try await SCShareableContent.current.displays
             if let match = displays.first(where: { $0.displayID == id && $0.width > 0 && $0.height > 0 }) {
                 return match
             }
-            try await Task.sleep(for: .milliseconds(50))
+            if checkCancellation {
+                try await Task.sleep(for: .milliseconds(50))
+            } else {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
         }
         throw SenderError("The virtual display did not appear in ScreenCaptureKit")
     }
@@ -970,10 +1277,44 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Task { @MainActor [weak self] in
-            guard let self, !self.stopped, stream === self.stream else { return }
+            guard let self, !self.stopped, !self.resetting, stream === self.stream else { return }
             SenderLog.info("Capture stream interrupted (\(error.localizedDescription)); recovering in place")
             await self.recoverStream()
         }
+    }
+
+    @MainActor
+    func stopAsync(_ reason: String) async {
+        let stats: (UInt64, UInt64, Double)? = lock.withLock {
+            guard !stopped else { return nil }
+            stopped = true
+            pendingImage = nil
+            pendingPts = .invalid
+            return (framesEncoded, framesDropped, totalEncodeMs)
+        }
+        guard let (encodedCount, droppedCount, totalMs) = stats else { return }
+        transport.onVideoDrained = nil
+        modeTask?.cancel(); modeTask = nil
+        if reconfigRegistered, let ctx = reconfigContext {
+            CGDisplayRemoveReconfigurationCallback(Self.displayReconfigurationCallback, ctx)
+            reconfigRegistered = false
+            reconfigContext = nil
+        }
+        inputQueue.sync {
+            self.input?.cancel()
+            self.input?.detach()
+            self.input = nil
+        }
+        if let activeStream = stream {
+            stream = nil
+            try? activeStream.removeStreamOutput(self, type: .screen)
+            try? await activeStream.stopCapture()
+        }
+        sampleQueue.sync {
+            self.refineTimer?.cancel()
+            self.refineTimer = nil
+        }
+        finishTeardown(reason: reason, encodedCount: encodedCount, droppedCount: droppedCount, totalMs: totalMs)
     }
 
     @MainActor
@@ -1004,10 +1345,15 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             self.input = nil
         }
         if let activeStream = stream {
+            stream = nil
             try? activeStream.removeStreamOutput(self, type: .screen)
             activeStream.stopCapture { _ in }
-            stream = nil
         }
+        finishTeardown(reason: reason, encodedCount: encodedCount, droppedCount: droppedCount, totalMs: totalMs)
+    }
+
+    @MainActor
+    private func finishTeardown(reason: String, encodedCount: UInt64, droppedCount: UInt64, totalMs: Double) {
         if let encoder = encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         if let scalePool { CVPixelBufferPoolFlush(scalePool, .excessBuffers) }
@@ -1017,6 +1363,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             ActiveDisplayRegistry.shared.release(serialNum: serial)
             claimedSerialNum = nil
         }
+        VirtualDisplayCoordinator.shared.unregister(self)
         if let token = activityToken {
             ProcessInfo.processInfo.endActivity(token)
             activityToken = nil

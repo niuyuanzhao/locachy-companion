@@ -77,6 +77,17 @@ enum ConnectionTests {
         check(oneActiveSnap.links == [CableLink(name: "ipnet", index: 20, bridged: true)]
               && oneActiveSnap.activePorts == ["wiredA"],
               "accepts a Thunderbolt bridge and reports activePorts once a member has carrier")
+        let multiPeerSnap = LinkSnapshot(
+            links: [ipnetLink],
+            message: "Thunderbolt link ready.",
+            activePorts: ["wiredA"],
+            activeConnections: [101],
+            multiPeerPorts: ["wiredA": PeerPortCounts(active: 1, inactive: 1)]
+        )
+        check(multiPeerSnap.activeConnections == [101]
+              && multiPeerSnap.multiPeerPorts["wiredA"]?.total == 2
+              && multiPeerSnap.multiPeerPorts["wiredA"]?.inactive == 1,
+              "records per-port active/inactive ThunderboltIP peer counts on shared dock ports")
         check(LinkInterfaces.classify([interface("wiredA", 4, ready: true, carrierActive: false)],
                                       thunderbolt: ["wiredA"], members: [:]).links.isEmpty,
               "ignores a standalone Thunderbolt port without active hardware carrier")
@@ -168,6 +179,28 @@ enum ConnectionTests {
         backoff.reset(for: "peer-a")
         check(backoff.canAttempt("peer-a", now: 150.0) && backoff.failureCount(for: "peer-a") == 0,
               "ReconnectBackoff resets immediately on replug or successful connect")
+
+        var manual = ManualDisconnectTracker(absenceClearDelay: 8.0)
+        manual.markDisconnected("peer-a")
+        check(manual.contains("peer-a"), "ManualDisconnectTracker remembers manually disconnected peer")
+        // Brief cancel/re-advertise bounce after Mac disconnect must not clear the latch.
+        let rem1 = manual.reconcile(presentKeys: [], now: 100.0)
+        check(manual.contains("peer-a") && rem1 == 8.0,
+              "ManualDisconnectTracker keeps disconnected peer latched while waiting for absence delay")
+        let rem2 = manual.reconcile(presentKeys: ["peer-a"], now: 102.0)
+        check(manual.contains("peer-a") && rem2 == nil,
+              "ManualDisconnectTracker preserves manual disconnect when receiver re-advertises on waiting screen")
+        // Continuous absence once receiver actually quits extdisplay clears the latch.
+        let rem3 = manual.reconcile(presentKeys: [], now: 110.0)
+        let rem4 = manual.reconcile(presentKeys: [], now: 117.9)
+        check(manual.contains("peer-a") && rem3 == 8.0 && (rem4 ?? 0) > 0,
+              "ManualDisconnectTracker does not clear before the full absence grace period elapses")
+        let rem5 = manual.reconcile(presentKeys: [], now: 118.0)
+        check(!manual.contains("peer-a") && rem5 == nil && manual.isEmpty,
+              "ManualDisconnectTracker clears latch once receiver stays absent past the grace period")
+        manual.markDisconnected("peer-b")
+        manual.clear("peer-b")
+        check(!manual.contains("peer-b"), "ManualDisconnectTracker clears immediately on explicit Connect")
 
         // PeerStore tests (isolated in a temporary directory)
         let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("locachy-peerstore-\(UUID().uuidString)", isDirectory: true)

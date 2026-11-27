@@ -27,7 +27,8 @@ brew services start locachy-macos-sender
 
 ## 多屏并行会话与持久配对
 
-- **多接收端同时在线**：在已有扩展屏串流时，雷电链路监听与 Bonjour 发现保持常开；新接入第二台、第三台 LOCachy 时会自动建立各自独立的虚拟显示器、采集通道与 VideoToolbox 硬件编码会话，不会打断现有屏幕。
+- **多接收端同时在线**：在已有扩展屏串流时，雷电链路监听与 Bonjour 发现保持常开；新接入第二台、第三台 LOCachy 时会自动建立各自独立的虚拟显示器、采集通道与 VideoToolbox 硬件编码会话。为规避 macOS ScreenCaptureKit 在已有虚拟屏活跃时新增或重连虚拟屏导致的画面串流问题（`FB17797423`），接入新虚拟屏时会短暂暂停并同步重建当前所有虚拟显示器，再统一启动各路采集（期间保留现有 TLS 连接与编码器）。若两台主机经同一个 Hub／Dock 共用同一个 Mac 雷电口而 macOS ThunderboltIP 只向其中一个对端发包，请将第二台主机接到 Mac 另一个独立的雷电口。
+- **菜单栏控制与软件断开**：后台运行时，发送端会在 macOS 菜单栏显示显示器图标。可在菜单栏（或 **Show Window…** 打开主窗口）中一键断开单个扩展屏（**Disconnect `<receiver>`**）或全部扩展屏，无需拔出雷电线或扩展坞，也可随时点击 **Connect `<receiver>`** 重新连接。从 Mac 断开后，LOCachy 端会立即退回等待界面（可按 `Ctrl+Q` 退出或 `Super+Esc` 返回主界面），并且在点击 **Connect** 或接收端离开 mDNS 发现（例如在 Linux 端退出 `extdisplay`）之前不会自动重新接管。
 - **稳定的每设备虚拟显示器标识**：每个虚拟显示器按接收端的 `hostId`（无 `hostId` 时回退至 `host`、`model` 与面板尺寸）确定性推导非零 `serialNum`、`productID`（`0x4C00–0x4CFF`）以及显示名称（`LOCachy-<host>`；主机名未设置或为 `locachy` 时回退到机器型号或 `hostId` 短前缀），并在进程内避免冲突，使 macOS 独立记住每台 LOCachy 的排列位置、分辨率、HiDPI 缩放与色彩配置。
 - **一次配对持久复用（`peers.json`）**：支持携带 `hostid=` 与 `paired=1`（可省去明文 `code=`）的新版广播，凭据以原子写入方式保存在 `~/Library/Application Support/LOCachy/peers.json`（目录 `0700`、文件 `0600`）；对仅广播临时配对码的旧版接收端保持 100% 向后兼容且不落盘临时码。
   - 可在连接窗口点击 **Pair…** 粘贴 LOCachy 生成的配对口令，或通过命令行导入（命令行从标准输入读取口令，避免长期密钥出现在进程列表中）：

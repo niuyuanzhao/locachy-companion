@@ -64,6 +64,7 @@ final class Sender {
     private static let inputTypes: Set<String> = [
         "key", "pointer", "button", "scroll", "cancel", "touch", "tablet", "capsLockToggle", "capsLockState"
     ]
+    private let endpoint: CableEndpoint
     private let transport: SecureTransport
     private let inputCoordinator: InputCoordinator
     private let discoveredHostID: String?
@@ -83,6 +84,7 @@ final class Sender {
         // Revalidate immediately before dialing, including bridge members and
         // the interface index. Advertisements are not authorization.
         try LinkInterfaces.require(endpoint.interface, index: endpoint.interfaceIndex)
+        self.endpoint = endpoint
         self.inputCoordinator = inputCoordinator
         self.discoveredHostID = discoveredHostID
         transport = try SecureTransport(endpoint: endpoint, key: key, identity: identity)
@@ -118,7 +120,7 @@ final class Sender {
     }
 
     func run() {
-        SenderLog.info("Connecting over the selected Thunderbolt link")
+        SenderLog.info("Connecting to \(endpoint.host):\(endpoint.port) over \(endpoint.interface)")
         transport.start()
     }
 
@@ -215,7 +217,7 @@ final class Sender {
             // Do not let a suspended startCapture create a stream after cleanup.
             await pendingStart?.value
             if let capture = self.capture {
-                capture.stop(reason)
+                await capture.stopAsync(reason)
                 self.capture = nil
             } else {
                 SenderLog.info(reason)

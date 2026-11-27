@@ -727,8 +727,8 @@ final class RemoteInput {
         case suppressed
     }
 
-    private let bounds: () -> CGRect
-    private let displays: () -> [CGRect]
+    private var bounds: () -> CGRect
+    private var displays: () -> [CGRect]
     private let live: Bool
     private let sink: Sink
     private let keyboardSink: Sink
@@ -871,6 +871,20 @@ final class RemoteInput {
         coordinator.clearHid(sessionID: sessionID, hadKeys: hadHid, forceResetIfEmpty: false)
         coordinator.unregisterCapsLockSubscriber(sessionID: sessionID)
         coordinator.unregisterSession(sessionID)
+    }
+
+    // Must be called on inputQueue when the virtual display is recreated with a new CGDirectDisplayID.
+    func updateDisplayID(_ displayID: CGDirectDisplayID) {
+        guard live else { return }
+        bounds = { CGDisplayBounds(displayID) }
+        displays = {
+            var count: UInt32 = 0
+            var list = [CGDirectDisplayID](repeating: 0, count: 16)
+            CGGetActiveDisplayList(16, &list, &count)
+            let rects = (0..<Int(count)).map { CGDisplayBounds(list[$0]) }.filter { !$0.isEmpty }
+            return rects.isEmpty ? [CGDisplayBounds(displayID)] : rects
+        }
+        invalidateDisplayCache()
     }
 
     deinit {

@@ -202,6 +202,29 @@ final class ReceiverDiscovery {
         changed()
     }
 
+    // Re-issues DNSServiceBrowse on already-active links without tearing down
+    // already-resolved receivers (e.g. when a second Thunderbolt port or dock
+    // peer comes up on the same bridge0).
+    func refresh(_ links: [CableLink]) {
+        lastLinks = links
+        let wanted = Dictionary(links.prefix(16).map { ($0.index, $0) }, uniquingKeysWith: { first, _ in first })
+        for (index, browser) in Array(browsers) where wanted[index] != browser.link {
+            browser.stop(); browsers.removeValue(forKey: index)
+        }
+        for link in wanted.values {
+            if let existing = browsers[link.index] {
+                existing.refreshBrowse()
+            } else {
+                let browser = LinkBrowser(link: link)
+                browser.onChange = { [weak self] in self?.changed() }
+                browser.onError = { [weak self] message, isPolicy in self?.onError?(message, isPolicy) }
+                browsers[link.index] = browser
+                browser.start()
+            }
+        }
+        changed()
+    }
+
     func restart() {
         update(lastLinks, forceRestart: true)
     }
@@ -329,6 +352,15 @@ private final class LinkBrowser {
         }
         services[name] = service
         service.start()
+    }
+
+    func refreshBrowse() {
+        guard !stopped else { return }
+        for (name, service) in Array(services) where service.choice == nil || !service.isActive {
+            service.stop()
+            services.removeValue(forKey: name)
+        }
+        start()
     }
 
     func stop() {
@@ -491,4 +523,64 @@ private final class DiscoveredService {
         choice = nil
     }
     deinit { stop() }
+}
+
+// Tracks receivers manually disconnected from the Mac so they stay disconnected
+// across the receiver's brief cancel/re-advertise bounce after a session ends,
+// while automatically re-arming auto-connect once the receiver actually leaves
+// discovery (for example after quitting extdisplay on Linux).
+struct ManualDisconnectTracker {
+    static let defaultAbsenceClearDelay: TimeInterval = 8.0
+    private let absenceClearDelay: TimeInterval
+    private var disconnectedKeys = Set<String>()
+    private var absentSince: [String: TimeInterval] = [:]
+
+    init(absenceClearDelay: TimeInterval = ManualDisconnectTracker.defaultAbsenceClearDelay) {
+        self.absenceClearDelay = absenceClearDelay
+    }
+
+    func contains(_ key: String) -> Bool {
+        disconnectedKeys.contains(key)
+    }
+
+    var isEmpty: Bool {
+        disconnectedKeys.isEmpty
+    }
+
+    mutating func markDisconnected(_ key: String) {
+        disconnectedKeys.insert(key)
+        absentSince.removeValue(forKey: key)
+    }
+
+    mutating func clear(_ key: String) {
+        disconnectedKeys.remove(key)
+        absentSince.removeValue(forKey: key)
+    }
+
+    mutating func clearAll() {
+        disconnectedKeys.removeAll()
+        absentSince.removeAll()
+    }
+
+    @discardableResult
+    mutating func reconcile(presentKeys: Set<String>, now: TimeInterval) -> TimeInterval? {
+        var soonestRemaining: TimeInterval?
+        for key in Array(disconnectedKeys) {
+            if presentKeys.contains(key) {
+                absentSince.removeValue(forKey: key)
+                continue
+            }
+            let since = absentSince[key] ?? now
+            absentSince[key] = since
+            let elapsed = now - since
+            if elapsed >= absenceClearDelay {
+                disconnectedKeys.remove(key)
+                absentSince.removeValue(forKey: key)
+            } else {
+                let remaining = absenceClearDelay - elapsed
+                soonestRemaining = soonestRemaining.map { min($0, remaining) } ?? remaining
+            }
+        }
+        return soonestRemaining
+    }
 }

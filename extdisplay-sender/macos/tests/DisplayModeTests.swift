@@ -210,11 +210,50 @@ enum DisplayModeTests {
         reg.release(serialNum: reclaimed.serialNum)
     }
 
+    static func testVirtualDisplayResetPolicy() {
+        final class Token {}
+        let tokenA = Token()
+        let tokenB = Token()
+        let a = ObjectIdentifier(tokenA)
+        let b = ObjectIdentifier(tokenB)
+        var policy = VirtualDisplayResetPolicy()
+
+        check(!policy.shouldResetBeforeAttach && !policy.partialDisconnectObserved,
+              "VirtualDisplayResetPolicy starts idle with no reset required for first display")
+        policy.recordAttach(a)
+        check(policy.shouldResetBeforeAttach && !policy.partialDisconnectObserved,
+              "VirtualDisplayResetPolicy requests reset when a second virtual display attaches alongside an active one")
+
+        // Single display disconnect leaves zero displays: next fresh attach needs no reset.
+        policy.recordDetach(a)
+        check(!policy.shouldResetBeforeAttach && !policy.partialDisconnectObserved,
+              "VirtualDisplayResetPolicy clears reset state once all virtual displays disconnect")
+
+        // Reset sequence when B joins A: drain to zero, attach A and B together.
+        policy.recordAttach(a)
+        policy.recordResetDrained()
+        check(!policy.shouldResetBeforeAttach && policy.activeTokens.isEmpty,
+              "VirtualDisplayResetPolicy clears active tokens after draining displays to zero")
+        policy.recordAttach(a)
+        policy.recordAttach(b)
+
+        // Partial disconnect (B leaves while A stays): marks partial disconnect, keeps A active.
+        policy.recordDetach(b)
+        check(policy.partialDisconnectObserved && policy.shouldResetBeforeAttach && policy.activeTokens == [a],
+              "VirtualDisplayResetPolicy marks partial disconnect when one virtual display detaches while another remains")
+
+        // Remaining display also detaches: table naturally resets to zero.
+        policy.recordDetach(a)
+        check(!policy.partialDisconnectObserved && !policy.shouldResetBeforeAttach && policy.activeTokens.isEmpty,
+              "VirtualDisplayResetPolicy clears partial disconnect once the last virtual display detaches")
+    }
+
     static func main() {
         testScaledModes()
         testMitchellScaling()
         testModeDB()
         testDisplayIdentity()
+        testVirtualDisplayResetPolicy()
         if failures != 0 {
             print("FAIL: \(failures) display mode test(s)")
             exit(1)

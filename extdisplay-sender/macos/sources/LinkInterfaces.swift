@@ -10,10 +10,18 @@ struct CableLink: Equatable, Hashable {
     let bridged: Bool
 }
 
+struct PeerPortCounts: Equatable {
+    let active: Int
+    let inactive: Int
+    var total: Int { active + inactive }
+}
+
 struct LinkSnapshot {
     var links: [CableLink]
     var message: String
     var activePorts: Set<String>
+    var activeConnections: Set<UInt64>
+    var multiPeerPorts: [String: PeerPortCounts]
     // A failed check is not an unplug. `complete` is false when the interface or
     // Thunderbolt list could not be read at all; `undetermined` names interfaces
     // whose state could not be established (an unreadable bridge, or a standalone
@@ -22,10 +30,14 @@ struct LinkSnapshot {
     var undetermined: Set<String>
 
     init(links: [CableLink], message: String, activePorts: Set<String> = [],
+         activeConnections: Set<UInt64> = [],
+         multiPeerPorts: [String: PeerPortCounts] = [:],
          complete: Bool = true, undetermined: Set<String> = []) {
         self.links = links
         self.message = message
         self.activePorts = activePorts
+        self.activeConnections = activeConnections
+        self.multiPeerPorts = multiPeerPorts
         self.complete = complete
         self.undetermined = undetermined
     }
@@ -185,7 +197,7 @@ enum LinkInterfaces {
                 index: iface.index,
                 bridge: iface.bridge,
                 ready: iface.ready && localIPv6.contains(iface.name),
-                carrierActive: tbPorts[iface.name] ?? true
+                carrierActive: tbPorts[iface.name]?.carrierActive ?? true
             )
         }
         let known = Set(interfaces.keys)
@@ -197,7 +209,21 @@ enum LinkInterfaces {
                 bridges[bridge.name] = members
             }
         }
-        return classify(list, thunderbolt: Set(tbPorts.keys), members: bridges)
+        var snapshot = classify(list, thunderbolt: Set(tbPorts.keys), members: bridges)
+        var activeConnections = Set<UInt64>()
+        var multiPeerPorts: [String: PeerPortCounts] = [:]
+        for (name, status) in tbPorts {
+            if snapshot.activePorts.contains(name) {
+                activeConnections.formUnion(status.activeConnections)
+            }
+            let counts = PeerPortCounts(active: status.activeConnections.count, inactive: status.inactiveConnections)
+            if counts.total > 1 {
+                multiPeerPorts[name] = counts
+            }
+        }
+        snapshot.activeConnections = activeConnections
+        snapshot.multiPeerPorts = multiPeerPorts
+        return snapshot
     }
 
     static func require(_ name: String, index: UInt32? = nil) throws {
@@ -207,15 +233,20 @@ enum LinkInterfaces {
         }
     }
 
-    // Returns each Thunderbolt IP BSD interface name mapped to whether its
-    // hardware carrier is currently active (IOLinkStatus has valid+active bits,
-    // or true if the driver does not publish IOLinkStatus). nil when the IOKit
-    // query itself fails, which proves nothing about the cable.
-    private static func thunderboltPorts() -> [String: Bool]? {
+    private struct ThunderboltPortStatus {
+        let carrierActive: Bool
+        let activeConnections: Set<UInt64>
+        let inactiveConnections: Int
+    }
+
+    // Returns each Thunderbolt IP BSD interface name mapped to its hardware
+    // carrier state (IOLinkStatus valid+active bits) and its child
+    // AppleThunderboltIPConnection states. nil when IOKit itself fails.
+    private static func thunderboltPorts() -> [String: ThunderboltPortStatus]? {
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IONetworkInterface"), &iterator) == KERN_SUCCESS else { return nil }
         defer { IOObjectRelease(iterator) }
-        var ports: [String: Bool] = [:]
+        var ports: [String: ThunderboltPortStatus] = [:]
         while true {
             let entry = IOIteratorNext(iterator)
             if entry == 0 { break }
@@ -226,6 +257,7 @@ enum LinkInterfaces {
             IOObjectRetain(ancestor)
             var isIP = false
             var carrierActive: Bool? = nil
+            var ipPortEntry: io_registry_entry_t = 0
             for _ in 0..<128 {
                 if carrierActive == nil,
                    let raw = IORegistryEntryCreateCFProperty(ancestor, "IOLinkStatus" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber {
@@ -237,8 +269,13 @@ enum LinkInterfaces {
                 }
                 // A generic Thunderbolt ancestor would also accept a dock's
                 // ordinary Ethernet adapter. Require the Thunderbolt IP driver.
-                if IOObjectConformsTo(ancestor, "AppleThunderboltIPPort") != 0
-                    || IOObjectConformsTo(ancestor, "AppleThunderboltIPService") != 0 {
+                if IOObjectConformsTo(ancestor, "AppleThunderboltIPPort") != 0 {
+                    isIP = true
+                    ipPortEntry = ancestor
+                    IOObjectRetain(ipPortEntry)
+                    break
+                }
+                if IOObjectConformsTo(ancestor, "AppleThunderboltIPService") != 0 {
                     isIP = true
                     break
                 }
@@ -248,7 +285,39 @@ enum LinkInterfaces {
                 ancestor = parent
             }
             IOObjectRelease(ancestor)
-            if isIP { ports[name] = carrierActive ?? true }
+            var activeConnections = Set<UInt64>()
+            var inactiveConnections = 0
+            if ipPortEntry != 0 {
+                defer { IOObjectRelease(ipPortEntry) }
+                var children: io_iterator_t = 0
+                if IORegistryEntryGetChildIterator(ipPortEntry, kIOServicePlane, &children) == KERN_SUCCESS {
+                    defer { IOObjectRelease(children) }
+                    while true {
+                        let child = IOIteratorNext(children)
+                        if child == 0 { break }
+                        defer { IOObjectRelease(child) }
+                        guard IOObjectConformsTo(child, "AppleThunderboltIPConnection") != 0 else { continue }
+                        let state = (IORegistryEntryCreateCFProperty(
+                            child, "Thunderbolt IP Connection State" as CFString, kCFAllocatorDefault, 0
+                        )?.takeRetainedValue() as? NSNumber)?.intValue ?? 0
+                        if state == 1 {
+                            var entryID: UInt64 = 0
+                            if IORegistryEntryGetRegistryEntryID(child, &entryID) == KERN_SUCCESS {
+                                activeConnections.insert(entryID)
+                            }
+                        } else {
+                            inactiveConnections += 1
+                        }
+                    }
+                }
+            }
+            if isIP {
+                ports[name] = ThunderboltPortStatus(
+                    carrierActive: carrierActive ?? true,
+                    activeConnections: activeConnections,
+                    inactiveConnections: inactiveConnections
+                )
+            }
         }
         return ports
     }

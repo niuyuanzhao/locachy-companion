@@ -84,3 +84,36 @@ final class ActiveDisplayRegistry {
         return activeSerials.contains(serialNum)
     }
 }
+
+// Coordinates virtual-display lifecycle to avoid Apple ScreenCaptureKit bug
+// FB17797423: attaching or re-attaching a CGVirtualDisplay while another
+// virtual display already has an active SCStream (or after a partial disconnect)
+// causes ScreenCaptureKit to stream the wrong virtual display's framebuffer
+// until active virtual displays briefly drop to zero and all virtual displays
+// are attached before starting SCStreams.
+struct VirtualDisplayResetPolicy {
+    private(set) var activeTokens = Set<ObjectIdentifier>()
+    private(set) var partialDisconnectObserved = false
+
+    var shouldResetBeforeAttach: Bool {
+        !activeTokens.isEmpty
+    }
+
+    mutating func recordAttach(_ token: ObjectIdentifier) {
+        activeTokens.insert(token)
+    }
+
+    mutating func recordDetach(_ token: ObjectIdentifier) {
+        guard activeTokens.remove(token) != nil else { return }
+        if activeTokens.isEmpty {
+            partialDisconnectObserved = false
+        } else {
+            partialDisconnectObserved = true
+        }
+    }
+
+    mutating func recordResetDrained() {
+        activeTokens.removeAll()
+        partialDisconnectObserved = false
+    }
+}
