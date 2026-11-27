@@ -21,6 +21,14 @@ brew services start locachy-macos-sender
 
 首次使用时：
 - 在 **系统设置 → 隐私与安全性** 中为 `LOCachy Extended Display` 授予 **屏幕录制** 与 **辅助功能** 权限。
+- 为使后续 `brew upgrade` 升级后继续保留上述授权，安装配方会使用位于 `$(brew --prefix)/var/locachy/` 的本地自签身份（`signing.keychain-db` 与权限 `0600` 的 `signing.pass`）重签已安装的 `.app`。每次 `post_install` 都复用同一张证书重签。若 `post_install` 输出 `warning:` 提示签名钥匙串问题（例如全新 Mac 尚无签名钥匙串），请在 Homebrew 之外运行一次以下命令初始化，然后执行 `brew reinstall niuyuanzhao/locachy/locachy-macos-sender`：
+  ```sh
+  sh "$(brew --prefix)/opt/locachy-macos-sender/share/locachy-macos-sender/build.sh" --sign \
+    "$(brew --prefix)/bin/locachy-macos-sender" \
+    "$(brew --prefix)/opt/locachy-macos-sender/LOCachy Extended Display.app" \
+    "$(brew --prefix)/var/locachy" \
+    "$(brew --prefix)/opt/locachy-macos-sender/libexec/locachy-hid-helper"
+  ```
 - 若安装了 `locachy-virtual-hid`，请在 **系统设置 → 登录项与扩展 → 驱动程序扩展**（或 **隐私与安全性**）中批准 **Karabiner-DriverKit-VirtualHIDDevice** 扩展。在批准生效前，键盘会自动无缝回退到物理键码 1:1 的 `CGEventPost` 模式。
 
 通过雷电／USB4 线缆、Hub、Dock 或菊花链连接并在一台或多台 LOCachy 上打开 `extdisplay` 后，后台服务会持续发现各个接收端并同时建立连接。

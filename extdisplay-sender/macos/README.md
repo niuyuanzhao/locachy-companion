@@ -21,6 +21,14 @@ brew services start locachy-macos-sender
 
 On the first run:
 - Grant **Screen Recording** and **Accessibility** to `LOCachy Extended Display` in **System Settings → Privacy & Security**.
+- To preserve those permissions across future `brew upgrade` runs, the formula signs the installed `.app` with a local self-signed identity stored in `$(brew --prefix)/var/locachy/` (`signing.keychain-db` and `0600` `signing.pass`). `post_install` reuses that same certificate on every upgrade. If it prints a `warning:` about the signing keychain (for example on a brand-new Mac where no keychain exists yet), run this once outside Homebrew, then run `brew reinstall niuyuanzhao/locachy/locachy-macos-sender`:
+  ```sh
+  sh "$(brew --prefix)/opt/locachy-macos-sender/share/locachy-macos-sender/build.sh" --sign \
+    "$(brew --prefix)/bin/locachy-macos-sender" \
+    "$(brew --prefix)/opt/locachy-macos-sender/LOCachy Extended Display.app" \
+    "$(brew --prefix)/var/locachy" \
+    "$(brew --prefix)/opt/locachy-macos-sender/libexec/locachy-hid-helper"
+  ```
 - When `locachy-virtual-hid` is installed, approve the **Karabiner-DriverKit-VirtualHIDDevice** driver extension in **System Settings → Login Items & Extensions → Driver Extensions** (or **Privacy & Security**). Until approved, keyboard input automatically falls back to physical 1:1 `CGEventPost` without interruption.
 
 When `extdisplay` is opened on one or more LOCachy machines over Thunderbolt/USB4 cables, hubs, docks, or daisy chains, the background service discovers each receiver continuously and connects them simultaneously.

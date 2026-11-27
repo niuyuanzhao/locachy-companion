@@ -5,8 +5,12 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# The signing keychain passphrase is random per user and kept in the login keychain
-# under this service name. It is never written into this repository.
+# The signing keychain passphrase is random per user. It is stored with mode 0600
+# in SIGN_DIR/signing.pass alongside signing.keychain-db so Homebrew's sandboxed
+# post_install (which denies reading ~/Library/Keychains) can unlock the existing
+# keychain without falling back to ad-hoc signatures. Legacy passphrases stored in
+# login.keychain-db under SIGN_PASS_SERVICE are read as a fallback outside the
+# sandbox and migrated into SIGN_DIR/signing.pass. Neither file enters this repo.
 SIGN_PASS_SERVICE="org.locachy.extdisplay.signing-keychain"
 SIGN_CERT="LOCachy Extended Display Signing"
 SIGN_ACCOUNT="${USER:-$(id -un 2>/dev/null || printf '%s' locachy)}"
@@ -15,14 +19,28 @@ REAL_HOME="${REAL_HOME:-/Users/$SIGN_ACCOUNT}"
 LOGIN_KC="$REAL_HOME/Library/Keychains/login.keychain-db"
 SIGN_STAGE_DIR=""
 
-sign_keychain_pass_get() {
-    HOME="$REAL_HOME" security find-generic-password -a "$SIGN_ACCOUNT" -s "$SIGN_PASS_SERVICE" -w "$LOGIN_KC" 2>/dev/null || true
+sign_pass_file_read() {
+    PFILE=$1
+    if [ -r "$PFILE" ]; then
+        IFS= read -r PVAL < "$PFILE" || true
+        printf '%s' "$PVAL"
+    fi
 }
 
-sign_keychain_pass_set() {
-    NEW_PASS=$1
-    printf 'add-generic-password -a "%s" -s "%s" -w "%s" -T /usr/bin/security "%s"\n' \
-        "$SIGN_ACCOUNT" "$SIGN_PASS_SERVICE" "$NEW_PASS" "$LOGIN_KC" | HOME="$REAL_HOME" security -i >/dev/null 2>&1
+sign_pass_file_write() {
+    PFILE=$1
+    NEW_PASS=$2
+    TMP_PASS="${PFILE}.tmp.$$"
+    if (umask 077; printf '%s\n' "$NEW_PASS" > "$TMP_PASS") && mv -f -- "$TMP_PASS" "$PFILE"; then
+        chmod 600 "$PFILE" 2>/dev/null || true
+        return 0
+    fi
+    rm -f -- "$TMP_PASS"
+    return 1
+}
+
+sign_keychain_pass_get() {
+    HOME="$REAL_HOME" security find-generic-password -a "$SIGN_ACCOUNT" -s "$SIGN_PASS_SERVICE" -w "$LOGIN_KC" 2>/dev/null || true
 }
 
 sign_keychain_lock() {
@@ -68,16 +86,26 @@ sign_outputs() {
     SIGN_TMP=$4
     SIGN_HELPER=${5:-}
     EPHEMERAL="${LOCACHY_SIGN_EPHEMERAL:-0}"
+    ISOLATED="${LOCACHY_SIGN_ISOLATED:-0}"
     KEYCHAIN=""
+    PASS_STORE=""
     if [ "$EPHEMERAL" != "1" ]; then
         mkdir -p -- "$SIGN_DIR" 2>/dev/null || SIGN_DIR="$SIGN_TMP/signing"
         mkdir -p -- "$SIGN_DIR"
         chmod 700 "$SIGN_DIR" 2>/dev/null || true
         KEYCHAIN="$SIGN_DIR/signing.keychain-db"
-        MIGRATE_KC="$REAL_HOME/Library/Application Support/LOCachy/signing.keychain-db"
-        if [ ! -f "$KEYCHAIN" ] && [ -f "$MIGRATE_KC" ]; then
-            cp -- "$MIGRATE_KC" "$KEYCHAIN" 2>/dev/null || true
-            chmod 600 "$KEYCHAIN" 2>/dev/null || true
+        PASS_STORE="$SIGN_DIR/signing.pass"
+        if [ "$ISOLATED" != "1" ]; then
+            MIGRATE_KC="$REAL_HOME/Library/Application Support/LOCachy/signing.keychain-db"
+            MIGRATE_PASS="$REAL_HOME/Library/Application Support/LOCachy/signing.pass"
+            if [ ! -f "$KEYCHAIN" ] && [ -f "$MIGRATE_KC" ]; then
+                (umask 077; cp -- "$MIGRATE_KC" "$KEYCHAIN") 2>/dev/null || true
+                chmod 600 "$KEYCHAIN" 2>/dev/null || true
+            fi
+            if [ ! -f "$PASS_STORE" ] && [ -f "$MIGRATE_PASS" ]; then
+                (umask 077; cp -- "$MIGRATE_PASS" "$PASS_STORE") 2>/dev/null || true
+                chmod 600 "$PASS_STORE" 2>/dev/null || true
+            fi
         fi
     fi
 
@@ -89,21 +117,19 @@ sign_outputs() {
 
     KEYCHAIN_READY=0
     CREATED_NEW_KEYCHAIN=0
+    PASS=""
     if [ "$EPHEMERAL" = "1" ] || [ ! -f "$KEYCHAIN" ]; then
         if [ "$EPHEMERAL" = "1" ]; then
             # Test builds get a throwaway keychain under SIGN_STAGE_DIR. They never
             # read or change the user's signing keychain or the login keychain.
             PASS=$(openssl rand -hex 32)
         else
-            # One passphrase per user, shared by every copy of the keychain: reuse the stored
-            # one, and generate and store a new one only when none exists. Never overwrite it.
-            PASS=$(sign_keychain_pass_get)
+            PASS=$(sign_pass_file_read "$PASS_STORE")
+            if [ -z "$PASS" ] && [ "$ISOLATED" != "1" ]; then
+                PASS=$(sign_keychain_pass_get)
+            fi
             if [ -z "$PASS" ]; then
                 PASS=$(openssl rand -hex 32)
-                if ! sign_keychain_pass_set "$PASS"; then
-                    printf 'warning: cannot store the signing keychain passphrase in the login keychain; using ad-hoc signature\n' >&2
-                    PASS=""
-                fi
             fi
         fi
         if [ -n "$PASS" ]; then
@@ -141,9 +167,16 @@ EOF
             rm -f -- "$CNF" "$PASS_FILE" "$SIGN_STAGE_DIR/cs.key" "$SIGN_STAGE_DIR/cs.crt" "$SIGN_STAGE_DIR/cs.p12"
         fi
     else
-        PASS=$(sign_keychain_pass_get)
+        PASS=$(sign_pass_file_read "$PASS_STORE")
+        if [ -z "$PASS" ] && [ "$ISOLATED" != "1" ]; then
+            PASS=$(sign_keychain_pass_get)
+            if [ -n "$PASS" ]; then
+                sign_pass_file_write "$PASS_STORE" "$PASS" || \
+                    printf 'warning: cannot persist migrated passphrase to %s\n' "$PASS_STORE" >&2
+            fi
+        fi
         if [ -z "$PASS" ]; then
-            printf 'warning: signing keychain passphrase not found in login keychain for account %s; using ad-hoc signature\n' "$SIGN_ACCOUNT" >&2
+            printf 'warning: signing keychain passphrase not found in %s or login keychain for account %s; using ad-hoc signature\n' "$PASS_STORE" "$SIGN_ACCOUNT" >&2
         elif ! (umask 077; cp -- "$KEYCHAIN" "$STAGE_KC") 2>/dev/null; then
             printf 'warning: cannot copy signing keychain %s to staging path; using ad-hoc signature\n' "$KEYCHAIN" >&2
         else
@@ -152,7 +185,7 @@ EOF
                 security set-keychain-settings -l -u -t 300 "$STAGE_KC" >/dev/null 2>&1 || true
                 KEYCHAIN_READY=1
             else
-                printf 'warning: staged copy of %s did not unlock with the passphrase in the login keychain (%s); using ad-hoc signature\n' "$KEYCHAIN" "$UNLOCK_ERR" >&2
+                printf 'warning: staged copy of %s did not unlock with the stored passphrase (%s); using ad-hoc signature\n' "$KEYCHAIN" "$UNLOCK_ERR" >&2
             fi
         fi
     fi
@@ -168,12 +201,16 @@ EOF
     if [ "$KEYCHAIN_READY" -eq 1 ]; then
         sign_keychain_lock "$STAGE_KC"
         if [ "$EPHEMERAL" != "1" ] && [ "$CREATED_NEW_KEYCHAIN" -eq 1 ] && [ "$IDENTITY_SIGNED" -eq 1 ]; then
-            TMP_DEST="$SIGN_DIR/signing.keychain-db.tmp.$$"
-            if (umask 077; cp -- "$STAGE_KC" "$TMP_DEST") && chmod 600 "$TMP_DEST" 2>/dev/null && mv -f -- "$TMP_DEST" "$KEYCHAIN"; then
-                :
+            if ! sign_pass_file_write "$PASS_STORE" "$PASS"; then
+                printf 'warning: cannot save signing keychain passphrase to %s\n' "$PASS_STORE" >&2
             else
-                rm -f -- "$TMP_DEST"
-                printf 'warning: cannot save newly created signing keychain to %s\n' "$KEYCHAIN" >&2
+                TMP_DEST="$SIGN_DIR/signing.keychain-db.tmp.$$"
+                if (umask 077; cp -- "$STAGE_KC" "$TMP_DEST") && mv -f -- "$TMP_DEST" "$KEYCHAIN"; then
+                    chmod 600 "$KEYCHAIN" 2>/dev/null || true
+                else
+                    rm -f -- "$TMP_DEST"
+                    printf 'warning: cannot save newly created signing keychain to %s\n' "$KEYCHAIN" >&2
+                fi
             fi
         fi
     fi
@@ -282,8 +319,8 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>org.locachy.extdisplay.sender</string>
 <key>CFBundleName</key><string>LOCachy Extended Display</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.6.3</string>
-<key>CFBundleVersion</key><string>0.6.3</string>
+<key>CFBundleShortVersionString</key><string>0.6.4</string>
+<key>CFBundleVersion</key><string>0.6.4</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Discover and connect to the LOCachy extended display over a dedicated Thunderbolt or USB4 link.</string>
