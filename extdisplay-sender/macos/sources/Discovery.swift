@@ -584,3 +584,24 @@ struct ManualDisconnectTracker {
         return soonestRemaining
     }
 }
+
+// Selects the most human-readable label for a receiver across the menu bar and
+// window table: prefer the authenticated HELLO hostname/displayLabel (active or
+// remembered from the last session on this link) and stored paired displayName
+// over the random per-session mDNS service name (e.g. LOCachy-<16 hex>).
+enum ReceiverDisplayName {
+    static func preferred(
+        activeLabel: String?,
+        rememberedLabel: String?,
+        storedName: String?,
+        advertisedName: String?,
+        fallbackKey: String
+    ) -> String {
+        for candidate in [activeLabel, rememberedLabel, storedName, advertisedName] {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        return fallbackKey
+    }
+}

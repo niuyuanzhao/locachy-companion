@@ -68,6 +68,7 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var authFailedCode: [String: String] = [:]
     private var manualDisconnects = ManualDisconnectTracker()
     private var manualDisconnectClearWork: DispatchWorkItem?
+    private var knownDisplayLabels: [String: String] = [:]
     private var sessionErrors: [String: String] = [:]
     private var reconnectBackoff = ReconnectBackoff()
     private var retryWorkItems: [String: DispatchWorkItem] = [:]
@@ -410,6 +411,24 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    private func displayName(for row: RowItem) -> String {
+        let activeLabel: String?
+        if case .active(let label)? = row.session?.state {
+            activeLabel = label
+        } else {
+            activeLabel = nil
+        }
+        let remembered = knownDisplayLabels[row.key]
+            ?? row.choice.flatMap { knownDisplayLabels[$0.address] }
+        return ReceiverDisplayName.preferred(
+            activeLabel: activeLabel,
+            rememberedLabel: remembered,
+            storedName: row.storedPeer?.displayName,
+            advertisedName: row.choice?.name,
+            fallbackKey: row.key
+        )
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === statusMenu else { return }
         menu.removeAllItems()
@@ -438,9 +457,8 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
         let activeRows = rows.filter { $0.session != nil }
         for row in activeRows {
-            let name = row.choice?.name ?? row.storedPeer?.displayName ?? row.key
-            let linkText = row.choice.map { " (\($0.link.name))" } ?? ""
-            let item = NSMenuItem(title: "Disconnect \(name)\(linkText)", action: #selector(menuDisconnectPressed(_:)), keyEquivalent: "")
+            let name = displayName(for: row)
+            let item = NSMenuItem(title: "Disconnect \(name)", action: #selector(menuDisconnectPressed(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = row.key
             if let ejectIcon = NSImage(systemSymbolName: "eject", accessibilityDescription: "Disconnect") {
@@ -466,7 +484,8 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
         for row in idleChoices {
             guard let choice = row.choice else { continue }
             let needsPair = choice.pairedOnly && row.storedPeer == nil
-            let title = needsPair ? "Pair \(choice.name)…" : "Connect \(choice.name) (\(choice.link.name))"
+            let name = displayName(for: row)
+            let title = needsPair ? "Pair \(name)…" : "Connect \(name)"
             let action = needsPair ? #selector(pairPressed) : #selector(menuConnectPressed(_:))
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
@@ -649,11 +668,11 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             cell.lineBreakMode = .byTruncatingTail
         }
         if id.rawValue == "receiver" {
-            let name = item.choice?.name ?? item.storedPeer?.displayName ?? item.key
-            if let link = item.choice?.link.name {
-                cell.stringValue = "\(name) (\(link))"
-            } else {
+            let name = displayName(for: item)
+            if item.choice == nil && item.session == nil {
                 cell.stringValue = "\(name) (offline)"
+            } else {
+                cell.stringValue = name
             }
             cell.textColor = item.choice == nil && item.session == nil ? .secondaryLabelColor : .labelColor
         } else {
@@ -751,8 +770,8 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
             let lRank = lhs.session != nil ? 0 : (lhs.choice != nil ? 1 : 2)
             let rRank = rhs.session != nil ? 0 : (rhs.choice != nil ? 1 : 2)
             if lRank != rRank { return lRank < rRank }
-            let lName = lhs.choice?.name ?? lhs.storedPeer?.displayName ?? lhs.key
-            let rName = rhs.choice?.name ?? rhs.storedPeer?.displayName ?? rhs.key
+            let lName = displayName(for: lhs)
+            let rName = displayName(for: rhs)
             if lName != rName { return lName < rName }
             return lhs.key < rhs.key
         }
@@ -960,6 +979,8 @@ final class ConnectionWindow: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 guard let self, let sender, var active = self.sessions[key],
                       active.sender === sender else { return }
                 active.state = .active(panel.displayLabel)
+                self.knownDisplayLabels[key] = panel.displayLabel
+                self.knownDisplayLabels[active.choice.address] = panel.displayLabel
                 if active.rememberOnActive,
                    let hostID = panel.hostID ?? active.choice.hostID,
                    let saveIdentity = active.pendingIdentity,

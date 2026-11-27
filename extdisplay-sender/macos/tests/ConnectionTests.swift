@@ -202,6 +202,39 @@ enum ConnectionTests {
         manual.clear("peer-b")
         check(!manual.contains("peer-b"), "ManualDisconnectTracker clears immediately on explicit Connect")
 
+        check(ReceiverDisplayName.preferred(
+            activeLabel: "LOCachy-nyzsX1Yoga",
+            rememberedLabel: "LOCachy-old",
+            storedName: "Stored",
+            advertisedName: "LOCachy-6f9145bc2cb55b5f",
+            fallbackKey: "key1"
+        ) == "LOCachy-nyzsX1Yoga",
+              "ReceiverDisplayName prefers active authenticated displayLabel over random mDNS name")
+        check(ReceiverDisplayName.preferred(
+            activeLabel: nil,
+            rememberedLabel: "LOCachy-nyzsOMEN",
+            storedName: nil,
+            advertisedName: "LOCachy-6ff755590ac22298",
+            fallbackKey: "key2"
+        ) == "LOCachy-nyzsOMEN",
+              "ReceiverDisplayName keeps remembered displayLabel after manual disconnect")
+        check(ReceiverDisplayName.preferred(
+            activeLabel: nil,
+            rememberedLabel: nil,
+            storedName: "LOCachy-nyzsX1Yoga",
+            advertisedName: "LOCachy-6f9145bc2cb55b5f",
+            fallbackKey: "key1"
+        ) == "LOCachy-nyzsX1Yoga",
+              "ReceiverDisplayName uses stored paired displayName before session connects")
+        check(ReceiverDisplayName.preferred(
+            activeLabel: "  ",
+            rememberedLabel: nil,
+            storedName: "",
+            advertisedName: "LOCachy-6f9145bc2cb55b5f",
+            fallbackKey: "key1"
+        ) == "LOCachy-6f9145bc2cb55b5f",
+              "ReceiverDisplayName falls back to advertised service name when no hostname is known")
+
         // PeerStore tests (isolated in a temporary directory)
         let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("locachy-peerstore-\(UUID().uuidString)", isDirectory: true)
         let storeFile = tmpDir.appendingPathComponent("peers.json", isDirectory: false)
