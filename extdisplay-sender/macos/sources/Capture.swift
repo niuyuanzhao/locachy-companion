@@ -127,6 +127,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private let hostIDOverride: String?
     private let inputCoordinator: InputCoordinator
     private let sampleQueue = DispatchQueue(label: "locachy.macos.capture", qos: .userInteractive)
+    private let sendQueue = DispatchQueue(label: "locachy.macos.send", qos: .userInteractive)
     let inputQueue: DispatchQueue
     private let lock = NSLock()
     private var display: VirtualDisplay?
@@ -152,9 +153,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return stopped
     }
     private var needsKeyframe = true
-    private var encoding = false
-    private var lastSubmit = 0.0
-    private var encodeStart = 0.0
+    private var pacer: FramePacer
     private var cachedScrollScale = 1.0
     private var framesEncoded: UInt64 = 0
     private var framesDropped: UInt64 = 0
@@ -172,9 +171,13 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var consecutiveEncodeErrors = 0
     private var reconfigRegistered = false
     private var reconfigContext: UnsafeMutableRawPointer?
-    private lazy var ciContext: CIContext? = {
-        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
-        return CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+    private var metalScaler: MetalImageScaler?
+    private var metalScalerInitialized = false
+    private lazy var ciContext: CIContext = {
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+        }
+        return CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
     }()
     private var scalePool: CVPixelBufferPool?
     private let srgbSpace = CGColorSpace(name: CGColorSpace.sRGB)
@@ -185,6 +188,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
          inputQueue: DispatchQueue? = nil) {
         self.transport = transport
         self.panel = panel
+        self.pacer = FramePacer(fps: panel.fps)
         self.hostIDOverride = hostIDOverride
         self.inputCoordinator = inputCoordinator
         self.inputQueue = inputQueue ?? inputCoordinator.queue
@@ -605,7 +609,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     }
                     self.transport.onVideoDrained = { [weak self] in
                         self?.sampleQueue.async { [weak self] in
-                            self?.drainPendingFrame(forceAdmission: true)
+                            self?.drainPendingFrame(forceAdmission: false)
                         }
                     }
                     let filter = SCContentFilter(display: target, excludingWindows: [])
@@ -662,7 +666,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             configuration.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
         } else {
             // Keep full-chroma 32BGRA for 4:4:4 codecs and for scaled modes so
-            // Metal Mitchell bicubic downscaling runs in RGB before 4:2:0 encoding.
+            // MPS GPU scaling runs in RGB before 4:2:0 encoding.
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
         }
         configuration.colorSpaceName = CGColorSpace.sRGB
@@ -1015,6 +1019,13 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         SenderLog.info("VideoToolbox encoder ready: negotiated=\(panel.codec), stream=\(activeCodec), hw=\(isUsingHardwareEncoder(created))")
     }
 
+    private enum SubmitOutcome {
+        case submitted
+        case busy
+        case paced(TimeInterval)
+        case stopped
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, CMSampleBufferIsValid(sample), let image = CMSampleBufferGetImageBuffer(sample) else { return }
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
@@ -1024,34 +1035,42 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             return
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-        if submitFrame(image, pts: pts, forceAdmission: false, storeIfBusy: true) {
+        switch submitFrame(image, pts: pts, forceAdmission: false, storeIfBusy: true) {
+        case .submitted, .stopped:
             refineTimer?.cancel()
             refineTimer = nil
-        } else {
-            scheduleRefinement()
+        case .paced(let delay):
+            scheduleRefinement(after: delay)
+        case .busy:
+            scheduleRefinement(after: FramePacer.busyFallbackDelay)
         }
     }
 
     private func drainPendingFrame(forceAdmission: Bool) {
         lock.lock()
-        guard !stopped, !encoding, let image = pendingImage else {
+        guard !stopped, let image = pendingImage else {
             lock.unlock()
             return
         }
         let pts = pendingPts.isValid ? pendingPts : CMClockGetTime(CMClockGetHostTimeClock())
         lock.unlock()
-        if submitFrame(image, pts: pts, forceAdmission: forceAdmission, storeIfBusy: false) {
+        switch submitFrame(image, pts: pts, forceAdmission: forceAdmission, storeIfBusy: false) {
+        case .submitted, .stopped:
             refineTimer?.cancel()
             refineTimer = nil
-        } else {
-            scheduleRefinement()
+        case .paced(let delay):
+            scheduleRefinement(after: delay)
+        case .busy:
+            scheduleRefinement(after: FramePacer.busyFallbackDelay)
         }
     }
 
-    private func scheduleRefinement() {
+    private func scheduleRefinement(after delay: TimeInterval) {
         refineTimer?.cancel()
+        let clampedDelay = max(FramePacer.minimumPacedDelay, delay)
+        let delayUs = max(1_000, Int((clampedDelay * 1_000_000.0).rounded(.up)))
         let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
-        timer.schedule(deadline: .now() + .milliseconds(16))
+        timer.schedule(deadline: .now() + .microseconds(delayUs), leeway: .microseconds(500))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.refineTimer?.cancel()
@@ -1062,11 +1081,24 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         refineTimer = timer
     }
 
+    private func resolveMetalScaler() -> MetalImageScaler? {
+        if !metalScalerInitialized {
+            metalScalerInitialized = true
+            metalScaler = MetalImageScaler()
+            if metalScaler == nil {
+                SenderLog.info("MetalPerformanceShaders scaler unavailable; falling back to CoreImage")
+            }
+        }
+        return metalScaler
+    }
+
     private func scaledBuffer(_ image: CVImageBuffer) -> CVImageBuffer {
         let srcW = CVPixelBufferGetWidth(image), srcH = CVPixelBufferGetHeight(image)
         if srcW == panel.width && srcH == panel.height { return image }
-        guard let ciContext else { return image }
         if scalePool == nil {
+            let poolAttrs: [CFString: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey: 3
+            ]
             let attrs: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey: panel.width,
@@ -1074,22 +1106,28 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!,
                 kCVPixelBufferIOSurfacePropertiesKey: [:]
             ]
-            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &scalePool)
+            CVPixelBufferPoolCreate(nil, poolAttrs as CFDictionary, attrs as CFDictionary, &scalePool)
         }
         guard let pool = scalePool else { return image }
         var dstOpt: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dstOpt) == kCVReturnSuccess, let dst = dstOpt else { return image }
         let isBGRA = CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA
+        if isBGRA, let scaler = resolveMetalScaler(), scaler.scale(from: image, to: dst) {
+            if let srgbSpace {
+                CVBufferSetAttachment(dst, kCVImageBufferCGColorSpaceKey, srgbSpace, .shouldPropagate)
+            }
+            return dst
+        }
         let input = (isBGRA
             ? CIImage(cvPixelBuffer: image, options: [.colorSpace: NSNull()])
             : CIImage(cvPixelBuffer: image)
         ).clampedToExtent()
-        guard let filter = CIFilter(name: "CIBicubicScaleTransform") else { return image }
+        guard let filter = CIFilter(name: "CILanczosScaleTransform") else { return image }
+        let scaleY = Double(panel.height) / Double(max(1, srcH))
+        let scaleX = Double(panel.width) / Double(max(1, srcW))
         filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(Double(panel.width) / Double(max(1, srcW)), forKey: kCIInputScaleKey)
-        filter.setValue((Double(panel.height) / Double(max(1, srcH))) / (Double(panel.width) / Double(max(1, srcW))), forKey: "inputAspectRatio")
-        filter.setValue(1.0 / 3.0, forKey: "inputB")
-        filter.setValue(1.0 / 3.0, forKey: "inputC")
+        filter.setValue(scaleY, forKey: kCIInputScaleKey)
+        filter.setValue(scaleX / max(1e-6, scaleY), forKey: kCIInputAspectRatioKey)
         guard let output = filter.outputImage?.cropped(to: CGRect(x: 0, y: 0, width: panel.width, height: panel.height)) else {
             return image
         }
@@ -1101,13 +1139,12 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return dst
     }
 
-    @discardableResult
-    private func submitFrame(_ image: CVImageBuffer, pts: CMTime, forceAdmission: Bool, storeIfBusy: Bool) -> Bool {
+    private func submitFrame(_ image: CVImageBuffer, pts: CMTime, forceAdmission: Bool, storeIfBusy: Bool) -> SubmitOutcome {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
-        guard !stopped else { lock.unlock(); return false }
-        guard !encoding, transport.canAcceptVideo, let encoder,
-              forceAdmission || now - lastSubmit >= 0.45 / Double(max(1, panel.fps)) else {
+        guard !stopped, let encoder else { lock.unlock(); return .stopped }
+        switch pacer.tryAdmit(now: now, transportCanAccept: transport.canAcceptVideo, forceAdmission: forceAdmission) {
+        case .busy:
             if storeIfBusy {
                 if pendingImage != nil {
                     framesDropped += 1
@@ -1116,88 +1153,168 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 pendingPts = pts
             }
             lock.unlock()
-            return false
+            return .busy
+        case .paced(let delay):
+            if storeIfBusy {
+                if pendingImage != nil {
+                    framesDropped += 1
+                }
+                pendingImage = image
+                pendingPts = pts
+            }
+            lock.unlock()
+            return .paced(delay)
+        case .admit:
+            break
         }
         if storeIfBusy && pendingImage != nil {
             framesDropped += 1
         }
         pendingImage = nil
         pendingPts = .invalid
-        encoding = true
-        lastSubmit = now
-        encodeStart = now
         let properties = needsKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary : nil
         needsKeyframe = false
         lock.unlock()
+
+        let frameStart = now
         let encodeImage = scaledBuffer(image)
         let status = VTCompressionSessionEncodeFrame(
             encoder, imageBuffer: encodeImage, presentationTimeStamp: pts,
             duration: .invalid, frameProperties: properties, infoFlagsOut: nil
-        ) { [weak self] status, _, output in self?.encoded(status: status, sample: output) }
+        ) { [weak self] status, _, output in
+            self?.encoded(status: status, sample: output, frameStart: frameStart)
+        }
         if status != noErr {
             SenderLog.info("Video encode submit failed: status=\(status)")
-            finishEncode(failed: true)
+            finishEncodeFailure(fatal: true)
         }
-        return true
+        return .submitted
     }
 
     // A bad frame is skipped and the next frame is forced to a keyframe. Only a
     // run of consecutive failures ends the session, so a single oversized or
     // dropped frame never tears down the stream, and a persistent fault never
     // freezes the picture silently.
-    private func frameFailed(_ detail: String) {
+    private func handleEncodeError(_ detail: String) {
         lock.lock()
         consecutiveEncodeErrors += 1
         let count = consecutiveEncodeErrors
         lock.unlock()
         SenderLog.info("Video encode/frame error: \(detail) consecutive=\(count)")
         if count >= 3 {
-            finishEncode(failed: true)
+            finishEncodeFailure(fatal: true)
         } else {
             requestKeyframe()
-            finishEncode(failed: false, skipped: true)
+            finishEncodeFailure(fatal: false)
         }
     }
 
-    private func encoded(status: OSStatus, sample: CMSampleBuffer?) {
+    private func finishEncodeFailure(fatal: Bool) {
+        var hasPending = false
+        var ended = false
+        lock.lock()
+        pacer.finishEncode(handoffToSend: false)
+        ended = stopped
+        if !fatal {
+            framesDropped += 1
+        }
+        hasPending = !ended && !fatal && pendingImage != nil
+        lock.unlock()
+        if fatal && !ended {
+            transport.stop("Video encoder failed")
+        } else if hasPending {
+            sampleQueue.async { [weak self] in
+                self?.drainPendingFrame(forceAdmission: false)
+            }
+        }
+    }
+
+    private func encoded(status: OSStatus, sample: CMSampleBuffer?, frameStart: TimeInterval) {
+        let encodeDone = ProcessInfo.processInfo.systemUptime
         guard status == noErr, let sample else {
-            frameFailed("status=\(status) sample=\(sample == nil ? "nil" : "present")")
+            handleEncodeError("status=\(status) sample=\(sample == nil ? "nil" : "present")")
+            return
+        }
+        let encodeMs = max(0.0, (encodeDone - frameStart) * 1000.0)
+        var shouldSend = false
+        var hasPending = false
+        lock.lock()
+        if stopped {
+            pacer.finishEncode(handoffToSend: false)
+        } else {
+            pacer.finishEncode(handoffToSend: true)
+            shouldSend = true
+            hasPending = pendingImage != nil
+        }
+        lock.unlock()
+        if hasPending {
+            sampleQueue.async { [weak self] in
+                self?.drainPendingFrame(forceAdmission: false)
+            }
+        }
+        guard shouldSend else { return }
+        // VideoToolbox invokes output callbacks serially in submission order
+        // when AllowFrameReordering is false; sendQueue preserves that exact
+        // order while freeing the encoder slot immediately for the next frame.
+        sendQueue.async { [weak self] in
+            self?.deliverEncodedSample(sample, encodeMs: encodeMs)
+        }
+    }
+
+    private func deliverEncodedSample(_ sample: CMSampleBuffer, encodeMs: Double) {
+        lock.lock()
+        let alreadyStopped = stopped
+        lock.unlock()
+        if alreadyStopped {
+            finishSend(failed: false, skipped: false, encodeMs: nil)
             return
         }
         guard let data = annexB(sample) else {
             let blockLen = CMSampleBufferGetDataBuffer(sample).map { CMBlockBufferGetDataLength($0) } ?? -1
-            frameFailed("annexB returned nil (blockBytes=\(blockLen), keyframe=\(isKeyframe(sample)))")
+            handleSendError("annexB returned nil (blockBytes=\(blockLen), keyframe=\(isKeyframe(sample)))")
             return
         }
         do {
             if !(try transport.sendVideo(data)) {
                 requestKeyframe()
-                finishEncode(failed: false, skipped: true)
+                finishSend(failed: false, skipped: true, encodeMs: nil)
                 return
             }
         } catch {
-            frameFailed("sendVideo threw (\(error), bytes=\(data.count))")
+            handleSendError("sendVideo threw (\(error), bytes=\(data.count))")
             return
         }
-        lock.lock()
-        consecutiveEncodeErrors = 0
-        lock.unlock()
-        finishEncode(failed: false)
+        finishSend(failed: false, skipped: false, encodeMs: encodeMs)
     }
 
-    private func finishEncode(failed: Bool, skipped: Bool = false) {
+    private func handleSendError(_ detail: String) {
+        lock.lock()
+        consecutiveEncodeErrors += 1
+        let count = consecutiveEncodeErrors
+        lock.unlock()
+        SenderLog.info("Video encode/frame error: \(detail) consecutive=\(count)")
+        if count >= 3 {
+            finishSend(failed: true, skipped: false, encodeMs: nil)
+        } else {
+            requestKeyframe()
+            finishSend(failed: false, skipped: true, encodeMs: nil)
+        }
+    }
+
+    private func finishSend(failed: Bool, skipped: Bool, encodeMs: Double?) {
         let now = ProcessInfo.processInfo.systemUptime
         var hasPending = false
         var ended = false
         var statsLine: String?
         lock.lock()
-        encoding = false
+        pacer.finishSend()
         ended = stopped
         if skipped {
             framesDropped += 1
-        } else if !failed {
+        } else if !failed, let encodeMs {
+            consecutiveEncodeErrors = 0
             framesEncoded += 1
-            totalEncodeMs += max(0.0, (now - encodeStart) * 1000.0)
+            totalEncodeMs += encodeMs
             if logPeriodicStats {
                 if lastStatsLog == 0.0 {
                     lastStatsLog = now
@@ -1215,7 +1332,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             transport.stop("Video encoder failed")
         } else if hasPending {
             sampleQueue.async { [weak self] in
-                self?.drainPendingFrame(forceAdmission: true)
+                self?.drainPendingFrame(forceAdmission: false)
             }
         }
     }
@@ -1356,6 +1473,9 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private func finishTeardown(reason: String, encodedCount: UInt64, droppedCount: UInt64, totalMs: Double) {
         if let encoder = encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
+        metalScaler?.flush()
+        metalScaler = nil
+        metalScalerInitialized = false
         if let scalePool { CVPixelBufferPoolFlush(scalePool, .excessBuffers) }
         scalePool = nil
         display = nil

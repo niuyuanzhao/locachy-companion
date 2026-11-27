@@ -188,7 +188,7 @@ struct Panel: Equatable {
         height = try Wire.integer(panel, panel["height"] == nil ? "pixelsHigh" : "height", 64...4096)
         _ = try Wire.number(panel, "scale", 0.5...4)
         // Enable HiDPI (@2x) for any mainstream panel resolution; Capture.swift's
-        // Metal bicubic scaler handles arbitrary ratios cleanly.
+        // MetalPerformanceShaders scaler handles arbitrary ratios cleanly.
         scale = (max(width, height) >= 640 && min(width, height) >= 480) ? 2 : 1
         // VirtualCanvasSizing rounds to even points; capture verifies the
         // resulting mode and the receiver reads the real size from the SPS.

@@ -8,6 +8,41 @@ mkdir -p "$OUT/tests"
 
 LOCACHY_SIGN_DIR="$OUT/signing" LOCACHY_SIGN_EPHEMERAL=1 "$HERE/build.sh" "$OUT"
 
+verify_signed() {
+    TARGET=$1
+    INFO=$(codesign -dv --verbose=2 "$TARGET" 2>&1)
+    if ! printf '%s\n' "$INFO" | grep -Fq "Authority=LOCachy Extended Display Signing"; then
+        printf 'FAIL: %s is not signed with LOCachy Extended Display Signing\n%s\n' "$TARGET" "$INFO" >&2
+        exit 1
+    fi
+    if printf '%s\n' "$INFO" | grep -Fq "Signature=adhoc"; then
+        printf 'FAIL: %s fell back to ad-hoc signature\n%s\n' "$TARGET" "$INFO" >&2
+        exit 1
+    fi
+    printf 'PASS: %s signed with LOCachy Extended Display Signing\n' "$(basename "$TARGET")"
+}
+
+verify_signed "$OUT/LOCachy Extended Display.app"
+verify_signed "$OUT/locachy-macos-sender"
+verify_signed "$OUT/locachy-hid-helper"
+
+SIGN_TEST="$OUT/tests/sign-sandbox"
+rm -rf -- "$SIGN_TEST"
+mkdir -p -- "$SIGN_TEST/dir"
+cp -- "$OUT/locachy-macos-sender" "$SIGN_TEST/locachy-macos-sender"
+cp -- "$OUT/locachy-hid-helper" "$SIGN_TEST/locachy-hid-helper"
+cp -R -- "$OUT/LOCachy Extended Display.app" "$SIGN_TEST/LOCachy Extended Display.app"
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$SIGN_TEST" LOCACHY_SIGN_EPHEMERAL=1 \
+    sh "$HERE/build.sh" --sign \
+    "$SIGN_TEST/locachy-macos-sender" \
+    "$SIGN_TEST/LOCachy Extended Display.app" \
+    "$SIGN_TEST/dir" \
+    "$SIGN_TEST/locachy-hid-helper"
+verify_signed "$SIGN_TEST/dir/LOCachy Extended Display.app"
+verify_signed "$SIGN_TEST/locachy-macos-sender"
+verify_signed "$SIGN_TEST/locachy-hid-helper"
+rm -rf -- "$SIGN_TEST"
+
 rm -f "$OUT/tests/protocol-tests"
 xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" -framework AppKit -framework Carbon \
@@ -35,10 +70,11 @@ xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos
 xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos13.0" \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
     -import-objc-header "$OUT/generated/Mac/CGVirtualDisplayPrivate.h" \
-    -framework CoreGraphics -framework CoreImage -framework CoreVideo \
+    -framework CoreGraphics -framework CoreImage -framework CoreVideo -framework Metal -framework MetalPerformanceShaders \
     "$OUT/generated/Mac/OriginRestore.swift" "$OUT/generated/Mac/VirtualCanvasSizing.swift" \
     "$OUT/generated/Mac/VirtualDisplay.swift" "$HERE/sources/UpstreamLog.swift" \
     "$HERE/sources/Wire.swift" "$HERE/sources/DisplayModeDB.swift" "$HERE/sources/DisplayIdentity.swift" \
+    "$HERE/sources/FramePipeline.swift" \
     "$HERE/tests/DisplayModeTests.swift" -o "$OUT/tests/display-mode-tests"
 "$OUT/tests/display-mode-tests"
 

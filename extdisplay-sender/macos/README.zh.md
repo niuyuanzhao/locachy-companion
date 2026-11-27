@@ -42,7 +42,7 @@ brew services start locachy-macos-sender
 
 ## 显示几何与输入转发
 
-接收端在已认证握手里上报面板物理像素尺寸（`pixelsWide × pixelsHigh`）、脱敏后的 `host`／`model` 机器标识、精确硬件视频解码能力（`hevc444`、`hevc420`、`h264` 或旧版 `hevc`）及输入能力（`touch`、`tablet`）。发送端据此为任意主流分辨率与纵横比自动推导 5 档 HiDPI 比例缩放及物理尺寸提示，在 **系统设置 → 显示器** 中提供“更大文字 ↔ 更多空间”缩略档位（高密度屏默认 `1:1` HiDPI，标准密度默认 `1:1` 原生），并按 `(host, model, pixelsWide × pixelsHigh)` 记入 `~/Library/Application Support/LOCachy/display-modes.json` 供重连自动恢复。处于 `1:1` 档位时零缩放直出；其余档位经 Metal Mitchell 双三次（`B=1/3, C=1/3`）无黑边采样至面板物理像素，并自动按双方硬件能力优先级（`hevc444 → hevc → hevc420 → h264`）以 VideoToolbox 硬件编码输出。
+接收端在已认证握手里上报面板物理像素尺寸（`pixelsWide × pixelsHigh`）、脱敏后的 `host`／`model` 机器标识、精确硬件视频解码能力（`hevc444`、`hevc420`、`h264` 或旧版 `hevc`）及输入能力（`touch`、`tablet`）。发送端据此为任意主流分辨率与纵横比自动推导 5 档 HiDPI 比例缩放及物理尺寸提示，在 **系统设置 → 显示器** 中提供“更大文字 ↔ 更多空间”缩略档位（高密度屏默认 `1:1` HiDPI，标准密度默认 `1:1` 原生），并按 `(host, model, pixelsWide × pixelsHigh)` 记入 `~/Library/Application Support/LOCachy/display-modes.json` 供重连自动恢复。处于 `1:1` 档位时零缩放直出；其余档位使用 Apple `MetalPerformanceShaders`（`MPSImageLanczosScale`，必要时回退至 CoreImage `CILanczosScaleTransform`）无黑边采样至面板物理像素，并自动按双方硬件能力优先级（`hevc444 → hevc → hevc420 → h264`）以 VideoToolbox 硬件编码输出。
 
 键盘转发保留物理 1:1 evdev 扫描码，让 macOS 原生接管键盘布局、输入法与修饰键状态：
 - 当 `locachy-hid-helper` 守护进程与 `Karabiner-DriverKit-VirtualHIDDevice` 驱动扩展就绪时，evdev 键码直接编码为标准 USB HID Keyboard／Consumer 报告注入虚拟 USB 键盘。`locachy-hid-helper` 通过内核 `audit_token`、当前控制台用户 UID、可执行文件路径和签名标识（`org.locachy.extdisplay.sender`）严格校验连接者身份，并在发送端断开或退出时立即发送全键释放与重置报告，避免任何修饰键卡死。

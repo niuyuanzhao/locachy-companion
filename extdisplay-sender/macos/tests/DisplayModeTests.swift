@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Pure unit tests for VirtualDisplay.scaledModes and Mitchell-Netravali
-// CIBicubicScaleTransform scaling. No WindowServer display is created and no
+// Pure unit tests for VirtualDisplay.scaledModes, MetalPerformanceShaders
+// downscaling, and frame pacing. No WindowServer display is created and no
 // TCC permissions or live session are touched.
 import CoreGraphics
 import CoreImage
 import CoreVideo
 import Foundation
+import Metal
+import MetalPerformanceShaders
 
 enum SenderLog {
     static func info(_ text: String) {}
@@ -58,27 +60,23 @@ enum DisplayModeTests {
               "omits scaled modes exceeding descriptor pixel capacity")
     }
 
-    static func testMitchellScaling() {
-        let srcW = 320, srcH = 240
-        let dstW = 200, dstH = 150
+    static func makeBGRAPixelBuffer(width: Int, height: Int, fill: (Int, Int) -> UInt8) -> CVPixelBuffer? {
         let attrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferMetalCompatibilityKey: kCFBooleanTrue!,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ]
-        var srcOpt: CVPixelBuffer?, dstOpt: CVPixelBuffer?
-        CVPixelBufferCreate(nil, srcW, srcH, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &srcOpt)
-        CVPixelBufferCreate(nil, dstW, dstH, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &dstOpt)
-        guard let src = srcOpt, let dst = dstOpt else {
-            check(false, "allocates offscreen BGRA pixel buffers for Mitchell scaling")
-            return
-        }
-        CVPixelBufferLockBaseAddress(src, [])
-        if let base = CVPixelBufferGetBaseAddress(src) {
-            let bpr = CVPixelBufferGetBytesPerRow(src)
-            for y in 0..<srcH {
+        var bufOpt: CVPixelBuffer?
+        guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &bufOpt) == kCVReturnSuccess,
+              let buf = bufOpt else { return nil }
+        CVPixelBufferLockBaseAddress(buf, [])
+        defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+        if let base = CVPixelBufferGetBaseAddress(buf) {
+            let bpr = CVPixelBufferGetBytesPerRow(buf)
+            for y in 0..<height {
                 let row = base.advanced(by: y * bpr).assumingMemoryBound(to: UInt8.self)
-                for x in 0..<srcW {
-                    let v: UInt8 = (x == 160 || x == 161) ? 255 : 33
+                for x in 0..<width {
+                    let v = fill(x, y)
                     row[x * 4 + 0] = v
                     row[x * 4 + 1] = v
                     row[x * 4 + 2] = v
@@ -86,43 +84,210 @@ enum DisplayModeTests {
                 }
             }
         }
-        CVPixelBufferUnlockBaseAddress(src, [])
+        return buf
+    }
 
-        guard let filter = CIFilter(name: "CIBicubicScaleTransform") else {
-            check(false, "CIBicubicScaleTransform filter is available")
+    static func testImageScaling() {
+        let srcW = 320, srcH = 240
+        let dstW = 200, dstH = 150
+        guard let src = makeBGRAPixelBuffer(width: srcW, height: srcH, fill: { x, _ in (x == 160 || x == 161) ? 255 : 33 }),
+              let dstMetal = makeBGRAPixelBuffer(width: dstW, height: dstH, fill: { _, _ in 0 }),
+              let dstCI = makeBGRAPixelBuffer(width: dstW, height: dstH, fill: { _, _ in 0 }) else {
+            check(false, "allocates offscreen BGRA pixel buffers for MPS scaling")
+            return
+        }
+
+        // 1. Production MetalPerformanceShaders (MPSImageLanczosScale) scaler.
+        guard let scaler = MetalImageScaler() else {
+            check(false, "initializes MetalImageScaler (MPSImageLanczosScale) pipeline")
+            return
+        }
+        let metalOK = scaler.scale(from: src, to: dstMetal)
+        check(metalOK, "MetalImageScaler scales BGRA pixel buffer via MPSImageLanczosScale")
+
+        CVPixelBufferLockBaseAddress(dstMetal, .readOnly)
+        if let base = CVPixelBufferGetBaseAddress(dstMetal) {
+            let bpr = CVPixelBufferGetBytesPerRow(dstMetal)
+            let rowMid = base.advanced(by: (dstH / 2) * bpr).assumingMemoryBound(to: UInt8.self)
+            var maxLuma = 0
+            var peakX = -1
+            for x in 0..<dstW {
+                let r = Int(rowMid[x * 4 + 2])
+                if r > maxLuma {
+                    maxLuma = r
+                    peakX = x
+                }
+            }
+            var maxBgDrift = 0
+            for x in 0..<dstW where abs(x - peakX) > 6 {
+                let drift = abs(Int(rowMid[x * 4 + 2]) - 33)
+                if drift > maxBgDrift { maxBgDrift = drift }
+            }
+            let cornerR = Int(base.assumingMemoryBound(to: UInt8.self)[2])
+            let cornerA = Int(base.assumingMemoryBound(to: UInt8.self)[3])
+            check(maxLuma >= 200 && abs(peakX - dstW / 2) <= 2,
+                  "MPSImageLanczosScale horizontal downscale preserves centered stroke contrast (max=\(maxLuma), peakX=\(peakX))")
+            check(maxBgDrift <= 1 && abs(cornerR - 33) <= 1 && cornerA == 255,
+                  "MPSImageLanczosScale edge clamping avoids dark border bleed and preserves alpha (bgDrift=\(maxBgDrift), corner=\(cornerR), alpha=\(cornerA))")
+        } else {
+            check(false, "reads MPS scaled output pixels")
+        }
+        CVPixelBufferUnlockBaseAddress(dstMetal, .readOnly)
+
+        // 2. Vertical stroke test + dynamic resize (400x300 -> 200x150).
+        if let srcVert = makeBGRAPixelBuffer(width: 400, height: 300, fill: { _, y in (y == 150 || y == 151) ? 255 : 33 }),
+           let dstVert = makeBGRAPixelBuffer(width: dstW, height: dstH, fill: { _, _ in 0 }) {
+            let vertOK = scaler.scale(from: srcVert, to: dstVert)
+            CVPixelBufferLockBaseAddress(dstVert, .readOnly)
+            if vertOK, let base = CVPixelBufferGetBaseAddress(dstVert) {
+                let bpr = CVPixelBufferGetBytesPerRow(dstVert)
+                var maxLuma = 0
+                var peakY = -1
+                let x = dstW / 2
+                for y in 0..<dstH {
+                    let row = base.advanced(by: y * bpr).assumingMemoryBound(to: UInt8.self)
+                    let r = Int(row[x * 4 + 2])
+                    if r > maxLuma {
+                        maxLuma = r
+                        peakY = y
+                    }
+                }
+                var maxBgDrift = 0
+                for y in 0..<dstH where abs(y - peakY) > 6 {
+                    let row = base.advanced(by: y * bpr).assumingMemoryBound(to: UInt8.self)
+                    let drift = abs(Int(row[x * 4 + 2]) - 33)
+                    if drift > maxBgDrift { maxBgDrift = drift }
+                }
+                let bottomRow = base.advanced(by: (dstH - 1) * bpr).assumingMemoryBound(to: UInt8.self)
+                let bottomR = Int(bottomRow[2])
+                let bottomA = Int(bottomRow[3])
+                check(maxLuma >= 195 && abs(peakY - dstH / 2) <= 2 && maxBgDrift <= 1 && abs(bottomR - 33) <= 1 && bottomA == 255,
+                      "MPSImageLanczosScale vertical pass handles dynamic resize cleanly (max=\(maxLuma), peakY=\(peakY), bgDrift=\(maxBgDrift), edge=\(bottomR), alpha=\(bottomA))")
+            } else {
+                check(false, "MPSImageLanczosScale vertical pass with dynamic resize")
+            }
+            CVPixelBufferUnlockBaseAddress(dstVert, .readOnly)
+        } else {
+            check(false, "allocates vertical stroke buffers for MPS scaling")
+        }
+        scaler.flush()
+
+        // 3. CoreImage CILanczosScaleTransform fallback still passes contrast and edge invariants.
+        guard let filter = CIFilter(name: "CILanczosScaleTransform") else {
+            check(false, "CILanczosScaleTransform fallback filter is available")
             return
         }
         let input = CIImage(cvPixelBuffer: src, options: [.colorSpace: NSNull()]).clampedToExtent()
+        let scaleY = Double(dstH) / Double(srcH)
+        let scaleX = Double(dstW) / Double(srcW)
         filter.setValue(input, forKey: kCIInputImageKey)
-        filter.setValue(Double(dstW) / Double(srcW), forKey: kCIInputScaleKey)
-        filter.setValue((Double(dstH) / Double(srcH)) / (Double(dstW) / Double(srcW)), forKey: "inputAspectRatio")
-        filter.setValue(1.0 / 3.0, forKey: "inputB")
-        filter.setValue(1.0 / 3.0, forKey: "inputC")
+        filter.setValue(scaleY, forKey: kCIInputScaleKey)
+        filter.setValue(scaleX / max(1e-6, scaleY), forKey: kCIInputAspectRatioKey)
         guard let out = filter.outputImage?.cropped(to: CGRect(x: 0, y: 0, width: dstW, height: dstH)) else {
-            check(false, "produces cropped Mitchell output image")
+            check(false, "produces cropped CoreImage Lanczos fallback output")
             return
         }
         let ctx = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
-        ctx.render(out, to: dst, bounds: CGRect(x: 0, y: 0, width: dstW, height: dstH), colorSpace: nil)
+        ctx.render(out, to: dstCI, bounds: CGRect(x: 0, y: 0, width: dstW, height: dstH), colorSpace: nil)
 
-        CVPixelBufferLockBaseAddress(dst, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(dst, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(dst) else {
-            check(false, "reads scaled output pixels")
+        CVPixelBufferLockBaseAddress(dstCI, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(dstCI, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(dstCI) else {
+            check(false, "reads CoreImage fallback output pixels")
             return
         }
-        let bpr = CVPixelBufferGetBytesPerRow(dst)
+        let bpr = CVPixelBufferGetBytesPerRow(dstCI)
         let rowMid = base.advanced(by: (dstH / 2) * bpr).assumingMemoryBound(to: UInt8.self)
-        var minLuma = 255, maxLuma = 0
+        var maxLuma = 0
+        var peakX = -1
         for x in 0..<dstW {
             let r = Int(rowMid[x * 4 + 2])
-            if r < minLuma { minLuma = r }
-            if r > maxLuma { maxLuma = r }
+            if r > maxLuma {
+                maxLuma = r
+                peakX = x
+            }
+        }
+        var maxBgDrift = 0
+        for x in 0..<dstW where abs(x - peakX) > 6 {
+            let drift = abs(Int(rowMid[x * 4 + 2]) - 33)
+            if drift > maxBgDrift { maxBgDrift = drift }
         }
         let cornerR = Int(base.assumingMemoryBound(to: UInt8.self)[2])
-        check(minLuma >= 28 && maxLuma >= 220,
-              "Mitchell downscale preserves stroke contrast without dark halo ringing (min=\(minLuma), max=\(maxLuma))")
-        check(cornerR == 33, "clamped extent avoids dark border bleed at frame edges (corner=\(cornerR))")
+        let cornerA = Int(base.assumingMemoryBound(to: UInt8.self)[3])
+        check(maxLuma >= 200 && abs(peakX - dstW / 2) <= 2,
+              "CoreImage Lanczos fallback preserves centered stroke contrast (max=\(maxLuma), peakX=\(peakX))")
+        check(maxBgDrift <= 1 && abs(cornerR - 33) <= 1 && cornerA == 255,
+              "CoreImage clamped extent avoids dark border bleed at frame edges (bgDrift=\(maxBgDrift), corner=\(cornerR), alpha=\(cornerA))")
+    }
+
+    static func testFramePacer() {
+        var pacer = FramePacer(fps: 60)
+        // minInterval = 0.45 / 60 = 0.0075 s (7.5 ms).
+        check(abs(pacer.minInterval - 0.0075) < 0.0001,
+              "FramePacer derives 7.5 ms minimum interval at 60 Hz")
+
+        // First frame admitted immediately even at t = 0.0.
+        check(pacer.tryAdmit(now: 0.0, transportCanAccept: true, forceAdmission: false) == .admit
+              && pacer.inFlightEncodes == 1,
+              "FramePacer admits first frame immediately")
+
+        // Frame arriving 3 ms later is paced for exact remaining 4.5 ms, not 16 ms.
+        if case .paced(let delay) = pacer.tryAdmit(now: 0.003, transportCanAccept: true, forceAdmission: false) {
+            check(abs(delay - 0.0045) < 0.0002 && pacer.inFlightEncodes == 1,
+                  "FramePacer returns exact remaining delay (\(String(format: "%.2f", delay * 1000))ms) when inside minInterval")
+        } else {
+            check(false, "FramePacer returns .paced(delay:) when inside minInterval")
+        }
+
+        // Frame arriving 7.2 ms later is clamped to >= 1 ms minimum pacing delay.
+        if case .paced(let delay) = pacer.tryAdmit(now: 0.0072, transportCanAccept: true, forceAdmission: false) {
+            check(abs(delay - FramePacer.minimumPacedDelay) < 0.0001,
+                  "FramePacer clamps tiny remaining pacing delay to 1 ms floor")
+        } else {
+            check(false, "FramePacer clamps tiny remaining pacing delay to 1 ms floor")
+        }
+
+        // Second frame at 16.67 ms enters VT concurrently while frame 1 is still encoding (2 in flight).
+        check(pacer.tryAdmit(now: 0.01667, transportCanAccept: true, forceAdmission: false) == .admit
+              && pacer.inFlightEncodes == 2,
+              "FramePacer allows up to 2 frames in flight in VideoToolbox")
+
+        // Third frame while 2 are encoding is rejected as .busy.
+        check(pacer.tryAdmit(now: 0.03333, transportCanAccept: true, forceAdmission: false) == .busy
+              && pacer.inFlightEncodes == 2,
+              "FramePacer rejects a 3rd concurrent encode as .busy")
+
+        // Frame 1 finishes VT encode and hands off to sendQueue -> encode slot frees immediately.
+        pacer.finishEncode(handoffToSend: true)
+        check(pacer.inFlightEncodes == 1 && pacer.inFlightSends == 1,
+              "FramePacer transfers completed encode atomically to send slot")
+        check(pacer.tryAdmit(now: 0.03333, transportCanAccept: true, forceAdmission: false) == .admit
+              && pacer.inFlightEncodes == 2,
+              "FramePacer admits frame 3 as soon as frame 1 hands off to sendQueue")
+
+        // Send queue backpressure caps at 2 in-flight sends; transport backpressure also returns .busy.
+        pacer.finishEncode(handoffToSend: true)
+        check(pacer.inFlightEncodes == 1 && pacer.inFlightSends == 2
+              && pacer.tryAdmit(now: 0.050, transportCanAccept: true, forceAdmission: false) == .busy,
+              "FramePacer respects maxInFlightSends backpressure")
+        pacer.finishSend()
+        check(pacer.inFlightSends == 1
+              && pacer.tryAdmit(now: 0.050, transportCanAccept: false, forceAdmission: false) == .busy,
+              "FramePacer respects transport.canAcceptVideo backpressure")
+
+        // forceAdmission bypasses minInterval (for timer expiry) while still enforcing capacity.
+        check(pacer.tryAdmit(now: 0.034, transportCanAccept: true, forceAdmission: true) == .admit
+              && pacer.inFlightEncodes == 2,
+              "FramePacer honors forceAdmission when a slot is free")
+
+        // Underflow protection.
+        pacer.finishEncode(handoffToSend: false)
+        pacer.finishEncode(handoffToSend: false)
+        pacer.finishEncode(handoffToSend: false)
+        pacer.finishSend()
+        pacer.finishSend()
+        check(pacer.inFlightEncodes == 0 && pacer.inFlightSends == 0,
+              "FramePacer clamps slot counters at zero on extra completions")
     }
 
     static func testModeDB() {
@@ -250,7 +415,8 @@ enum DisplayModeTests {
 
     static func main() {
         testScaledModes()
-        testMitchellScaling()
+        testImageScaling()
+        testFramePacer()
         testModeDB()
         testDisplayIdentity()
         testVirtualDisplayResetPolicy()

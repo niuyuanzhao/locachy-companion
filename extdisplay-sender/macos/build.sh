@@ -8,20 +8,57 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # The signing keychain passphrase is random per user and kept in the login keychain
 # under this service name. It is never written into this repository.
 SIGN_PASS_SERVICE="org.locachy.extdisplay.signing-keychain"
+SIGN_CERT="LOCachy Extended Display Signing"
+SIGN_ACCOUNT="${USER:-$(id -un 2>/dev/null || printf '%s' locachy)}"
+REAL_HOME=$(dscl . -read "/Users/$SIGN_ACCOUNT" NFSHomeDirectory 2>/dev/null | awk '/^NFSHomeDirectory:/ { sub(/^NFSHomeDirectory:[[:space:]]*/, ""); if (length($0) > 0) { print; exit } next_line = 1; next } next_line { sub(/^[[:space:]]+/, ""); print; exit }' || true)
+REAL_HOME="${REAL_HOME:-/Users/$SIGN_ACCOUNT}"
+LOGIN_KC="$REAL_HOME/Library/Keychains/login.keychain-db"
+SIGN_STAGE_DIR=""
 
 sign_keychain_pass_get() {
-    security find-generic-password -a "${USER:-locachy}" -s "$SIGN_PASS_SERVICE" -w 2>/dev/null || true
+    HOME="$REAL_HOME" security find-generic-password -a "$SIGN_ACCOUNT" -s "$SIGN_PASS_SERVICE" -w "$LOGIN_KC" 2>/dev/null || true
 }
 
 sign_keychain_pass_set() {
     NEW_PASS=$1
-    printf 'add-generic-password -a "%s" -s "%s" -w "%s" -T /usr/bin/security\n' \
-        "${USER:-locachy}" "$SIGN_PASS_SERVICE" "$NEW_PASS" | security -i >/dev/null 2>&1
+    printf 'add-generic-password -a "%s" -s "%s" -w "%s" -T /usr/bin/security "%s"\n' \
+        "$SIGN_ACCOUNT" "$SIGN_PASS_SERVICE" "$NEW_PASS" "$LOGIN_KC" | HOME="$REAL_HOME" security -i >/dev/null 2>&1
 }
 
 sign_keychain_lock() {
     KC_PATH=$1
     security lock-keychain "$KC_PATH" >/dev/null 2>&1 || true
+}
+
+cleanup_sign_stage() {
+    if [ -n "${SIGN_STAGE_DIR:-}" ]; then
+        sign_keychain_lock "$SIGN_STAGE_DIR/stage.keychain-db"
+        rm -rf -- "$SIGN_STAGE_DIR"
+        SIGN_STAGE_DIR=""
+    fi
+}
+
+sign_one() {
+    TARGET_PATH=$1
+    TARGET_ID=$2
+    EXTRA_FLAGS=$3
+    if [ "$KEYCHAIN_READY" -eq 1 ]; then
+        # shellcheck disable=SC2086
+        if CS_ERR=$(codesign --force $EXTRA_FLAGS --keychain "$STAGE_KC" --sign "$SIGN_CERT" --identifier "$TARGET_ID" "$TARGET_PATH" 2>&1); then
+            if codesign -dv --verbose=2 "$TARGET_PATH" 2>&1 | grep -Fq "Authority=$SIGN_CERT"; then
+                return 0
+            fi
+            printf 'warning: codesign succeeded for %s but Authority=%s was missing; falling back to ad-hoc signature\n' "$TARGET_PATH" "$SIGN_CERT" >&2
+        else
+            printf 'warning: codesign with %s failed for %s: %s; falling back to ad-hoc signature\n' "$SIGN_CERT" "$TARGET_PATH" "$CS_ERR" >&2
+        fi
+        IDENTITY_SIGNED=0
+    fi
+    # shellcheck disable=SC2086
+    if ! CS_ERR=$(codesign --force $EXTRA_FLAGS --sign - --identifier "$TARGET_ID" "$TARGET_PATH" 2>&1); then
+        printf 'warning: ad-hoc codesign failed for %s: %s\n' "$TARGET_PATH" "$CS_ERR" >&2
+    fi
+    return 0
 }
 
 sign_outputs() {
@@ -30,26 +67,32 @@ sign_outputs() {
     SIGN_DIR=$3
     SIGN_TMP=$4
     SIGN_HELPER=${5:-}
-    mkdir -p -- "$SIGN_DIR" 2>/dev/null || SIGN_DIR="$SIGN_TMP/signing"
-    mkdir -p -- "$SIGN_DIR"
-    chmod 700 "$SIGN_DIR" 2>/dev/null || true
     EPHEMERAL="${LOCACHY_SIGN_EPHEMERAL:-0}"
-    if [ "$EPHEMERAL" = "1" ]; then
-        # Test builds get a throwaway keychain under SIGN_TMP. They never read or
-        # change the user's signing keychain or the login keychain.
-        KEYCHAIN="$SIGN_TMP/ephemeral-signing.keychain-db"
-        rm -f -- "$KEYCHAIN"
-    else
+    KEYCHAIN=""
+    if [ "$EPHEMERAL" != "1" ]; then
+        mkdir -p -- "$SIGN_DIR" 2>/dev/null || SIGN_DIR="$SIGN_TMP/signing"
+        mkdir -p -- "$SIGN_DIR"
+        chmod 700 "$SIGN_DIR" 2>/dev/null || true
         KEYCHAIN="$SIGN_DIR/signing.keychain-db"
-        if [ ! -f "$KEYCHAIN" ] && [ -n "${USER:-}" ] && [ -f "/Users/$USER/Library/Application Support/LOCachy/signing.keychain-db" ]; then
-            cp -- "/Users/$USER/Library/Application Support/LOCachy/signing.keychain-db" "$KEYCHAIN" 2>/dev/null || true
+        MIGRATE_KC="$REAL_HOME/Library/Application Support/LOCachy/signing.keychain-db"
+        if [ ! -f "$KEYCHAIN" ] && [ -f "$MIGRATE_KC" ]; then
+            cp -- "$MIGRATE_KC" "$KEYCHAIN" 2>/dev/null || true
             chmod 600 "$KEYCHAIN" 2>/dev/null || true
         fi
     fi
 
+    # Always operate on a fresh temporary path so macOS securityd never serves a
+    # stale cached handle for the persistent on-disk keychain path.
+    SIGN_STAGE_DIR=$(mktemp -d "$SIGN_TMP/stage-kc.XXXXXX")
+    chmod 700 "$SIGN_STAGE_DIR" 2>/dev/null || true
+    STAGE_KC="$SIGN_STAGE_DIR/stage.keychain-db"
+
     KEYCHAIN_READY=0
-    if [ ! -f "$KEYCHAIN" ]; then
+    CREATED_NEW_KEYCHAIN=0
+    if [ "$EPHEMERAL" = "1" ] || [ ! -f "$KEYCHAIN" ]; then
         if [ "$EPHEMERAL" = "1" ]; then
+            # Test builds get a throwaway keychain under SIGN_STAGE_DIR. They never
+            # read or change the user's signing keychain or the login keychain.
             PASS=$(openssl rand -hex 32)
         else
             # One passphrase per user, shared by every copy of the keychain: reuse the stored
@@ -64,8 +107,8 @@ sign_outputs() {
             fi
         fi
         if [ -n "$PASS" ]; then
-            CNF="$SIGN_TMP/codesign-openssl.cnf"
-            PASS_FILE="$SIGN_TMP/p12.pass"
+            CNF="$SIGN_STAGE_DIR/codesign-openssl.cnf"
+            PASS_FILE="$SIGN_STAGE_DIR/p12.pass"
             cat >"$CNF" <<'EOF'
 [req]
 distinguished_name = dn
@@ -79,61 +122,74 @@ extendedKeyUsage = critical, codeSigning
 basicConstraints = critical, CA:FALSE
 EOF
             (umask 077; printf '%s\n' "$PASS" > "$PASS_FILE")
-            openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SIGN_TMP/cs.key" -out "$SIGN_TMP/cs.crt" -days 3650 -config "$CNF" >/dev/null 2>&1
-            openssl pkcs12 -export -out "$SIGN_TMP/cs.p12" -inkey "$SIGN_TMP/cs.key" -in "$SIGN_TMP/cs.crt" -passout "file:$PASS_FILE" -legacy >/dev/null 2>&1 || \
-                openssl pkcs12 -export -out "$SIGN_TMP/cs.p12" -inkey "$SIGN_TMP/cs.key" -in "$SIGN_TMP/cs.crt" -passout "file:$PASS_FILE" >/dev/null 2>&1
-            if {
-                printf 'create-keychain -p "%s" "%s"\n' "$PASS" "$KEYCHAIN"
-                printf 'unlock-keychain -p "%s" "%s"\n' "$PASS" "$KEYCHAIN"
-                printf 'set-keychain-settings -l -u -t 300 "%s"\n' "$KEYCHAIN"
-                printf 'import "%s" -k "%s" -P "%s" -T /usr/bin/codesign\n' "$SIGN_TMP/cs.p12" "$KEYCHAIN" "$PASS"
-                printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "%s" "%s"\n' "$PASS" "$KEYCHAIN"
-            } | security -i >/dev/null 2>&1; then
-                chmod 600 "$KEYCHAIN" 2>/dev/null || true
+            openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SIGN_STAGE_DIR/cs.key" -out "$SIGN_STAGE_DIR/cs.crt" -days 3650 -config "$CNF" >/dev/null 2>&1
+            openssl pkcs12 -export -out "$SIGN_STAGE_DIR/cs.p12" -inkey "$SIGN_STAGE_DIR/cs.key" -in "$SIGN_STAGE_DIR/cs.crt" -passout "file:$PASS_FILE" -legacy >/dev/null 2>&1 || \
+                openssl pkcs12 -export -out "$SIGN_STAGE_DIR/cs.p12" -inkey "$SIGN_STAGE_DIR/cs.key" -in "$SIGN_STAGE_DIR/cs.crt" -passout "file:$PASS_FILE" >/dev/null 2>&1
+            if CREATE_ERR=$({
+                printf 'create-keychain -p "%s" "%s"\n' "$PASS" "$STAGE_KC"
+                printf 'unlock-keychain -p "%s" "%s"\n' "$PASS" "$STAGE_KC"
+                printf 'set-keychain-settings -l -u -t 300 "%s"\n' "$STAGE_KC"
+                printf 'import "%s" -k "%s" -P "%s" -T /usr/bin/codesign\n' "$SIGN_STAGE_DIR/cs.p12" "$STAGE_KC" "$PASS"
+                printf 'set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "%s" "%s"\n' "$PASS" "$STAGE_KC"
+            } | security -i 2>&1 >/dev/null); then
+                chmod 600 "$STAGE_KC" 2>/dev/null || true
                 KEYCHAIN_READY=1
+                CREATED_NEW_KEYCHAIN=1
             else
-                printf 'warning: cannot create signing keychain %s; using ad-hoc signature\n' "$KEYCHAIN" >&2
+                printf 'warning: cannot create signing keychain (%s); using ad-hoc signature\n' "$CREATE_ERR" >&2
             fi
-            rm -f -- "$CNF" "$PASS_FILE" "$SIGN_TMP/cs.key" "$SIGN_TMP/cs.crt" "$SIGN_TMP/cs.p12"
+            rm -f -- "$CNF" "$PASS_FILE" "$SIGN_STAGE_DIR/cs.key" "$SIGN_STAGE_DIR/cs.crt" "$SIGN_STAGE_DIR/cs.p12"
         fi
     else
         PASS=$(sign_keychain_pass_get)
-        if [ -n "$PASS" ] && printf 'unlock-keychain -p "%s" "%s"\n' "$PASS" "$KEYCHAIN" | security -i >/dev/null 2>&1; then
-            security set-keychain-settings -l -u -t 300 "$KEYCHAIN" >/dev/null 2>&1 || true
-            KEYCHAIN_READY=1
+        if [ -z "$PASS" ]; then
+            printf 'warning: signing keychain passphrase not found in login keychain for account %s; using ad-hoc signature\n' "$SIGN_ACCOUNT" >&2
+        elif ! (umask 077; cp -- "$KEYCHAIN" "$STAGE_KC") 2>/dev/null; then
+            printf 'warning: cannot copy signing keychain %s to staging path; using ad-hoc signature\n' "$KEYCHAIN" >&2
         else
-            printf 'warning: %s does not open with the passphrase in the login keychain; using ad-hoc signature\n' "$KEYCHAIN" >&2
+            chmod 600 "$STAGE_KC" 2>/dev/null || true
+            if UNLOCK_ERR=$(printf 'unlock-keychain -p "%s" "%s"\n' "$PASS" "$STAGE_KC" | security -i 2>&1 >/dev/null); then
+                security set-keychain-settings -l -u -t 300 "$STAGE_KC" >/dev/null 2>&1 || true
+                KEYCHAIN_READY=1
+            else
+                printf 'warning: staged copy of %s did not unlock with the passphrase in the login keychain (%s); using ad-hoc signature\n' "$KEYCHAIN" "$UNLOCK_ERR" >&2
+            fi
         fi
     fi
 
+    IDENTITY_SIGNED=$KEYCHAIN_READY
+    sign_one "$SIGN_PRODUCT" org.locachy.extdisplay.sender ""
+    cp -- "$SIGN_PRODUCT" "$SIGN_APP/Contents/MacOS/locachy-macos-sender"
+    sign_one "$SIGN_APP" org.locachy.extdisplay.sender "--deep"
+    if [ -n "$SIGN_HELPER" ] && [ -f "$SIGN_HELPER" ]; then
+        sign_one "$SIGN_HELPER" org.locachy.extdisplay.hid-helper ""
+    fi
+
     if [ "$KEYCHAIN_READY" -eq 1 ]; then
-        codesign --force --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.sender "$SIGN_PRODUCT" >/dev/null 2>&1 || \
-            codesign --force --sign - --identifier org.locachy.extdisplay.sender "$SIGN_PRODUCT" >/dev/null 2>&1 || true
-        cp -- "$SIGN_PRODUCT" "$SIGN_APP/Contents/MacOS/locachy-macos-sender"
-        codesign --force --deep --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || \
-            codesign --force --deep --sign - --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || true
-        if [ -n "$SIGN_HELPER" ] && [ -f "$SIGN_HELPER" ]; then
-            codesign --force --keychain "$KEYCHAIN" --sign "LOCachy Extended Display Signing" --identifier org.locachy.extdisplay.hid-helper "$SIGN_HELPER" >/dev/null 2>&1 || \
-                codesign --force --sign - --identifier org.locachy.extdisplay.hid-helper "$SIGN_HELPER" >/dev/null 2>&1 || true
-        fi
-        sign_keychain_lock "$KEYCHAIN"
-        if [ "$EPHEMERAL" = "1" ]; then
-            rm -f -- "$KEYCHAIN"
-        fi
-    else
-        codesign --force --sign - --identifier org.locachy.extdisplay.sender "$SIGN_PRODUCT" >/dev/null 2>&1 || true
-        cp -- "$SIGN_PRODUCT" "$SIGN_APP/Contents/MacOS/locachy-macos-sender"
-        codesign --force --deep --sign - --identifier org.locachy.extdisplay.sender "$SIGN_APP" >/dev/null 2>&1 || true
-        if [ -n "$SIGN_HELPER" ] && [ -f "$SIGN_HELPER" ]; then
-            codesign --force --sign - --identifier org.locachy.extdisplay.hid-helper "$SIGN_HELPER" >/dev/null 2>&1 || true
+        sign_keychain_lock "$STAGE_KC"
+        if [ "$EPHEMERAL" != "1" ] && [ "$CREATED_NEW_KEYCHAIN" -eq 1 ] && [ "$IDENTITY_SIGNED" -eq 1 ]; then
+            TMP_DEST="$SIGN_DIR/signing.keychain-db.tmp.$$"
+            if (umask 077; cp -- "$STAGE_KC" "$TMP_DEST") && chmod 600 "$TMP_DEST" 2>/dev/null && mv -f -- "$TMP_DEST" "$KEYCHAIN"; then
+                :
+            else
+                rm -f -- "$TMP_DEST"
+                printf 'warning: cannot save newly created signing keychain to %s\n' "$KEYCHAIN" >&2
+            fi
         fi
     fi
+    cleanup_sign_stage
 }
 
 if [ "${1:-}" = "--sign" ]; then
     [ $# -eq 4 ] || [ $# -eq 5 ] || { printf '%s\n' 'usage: build.sh --sign PRODUCT APP SIGN_DIR [HELPER]' >&2; exit 2; }
     TMP_SIGN=$(mktemp -d "${TMPDIR:-/tmp}/locachy-sign.XXXXXX")
-    trap 'rm -rf -- "$TMP_SIGN"' EXIT
+    cleanup_sign_cmd() {
+        cleanup_sign_stage
+        rm -rf -- "$TMP_SIGN"
+    }
+    trap cleanup_sign_cmd EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     rm -rf -- "$4/LOCachy Extended Display.app"
     cp -R -- "$3" "$4/LOCachy Extended Display.app"
     sign_outputs "$2" "$4/LOCachy Extended Display.app" "$4" "$TMP_SIGN" "${5:-}"
@@ -181,7 +237,7 @@ TARGET="$(uname -m)-apple-macos13.0"
 "$SWIFTC" -swift-version 5 -parse-as-library -target "$TARGET" -sdk "$SDK" -O \
     -import-objc-header "$GENERATED/Mac/CGVirtualDisplayPrivate.h" \
     -framework AppKit -framework ApplicationServices -framework Carbon -framework CoreGraphics -framework CoreImage -framework CoreMedia \
-    -framework CoreServices -framework CoreVideo -framework IOKit -framework Metal -framework Network \
+    -framework CoreServices -framework CoreVideo -framework IOKit -framework Metal -framework MetalPerformanceShaders -framework Network \
     -framework ScreenCaptureKit -framework Security -framework VideoToolbox \
     "$GENERATED/Mac/OriginRestore.swift" \
     "$GENERATED/Mac/VirtualCanvasSizing.swift" \
@@ -197,6 +253,7 @@ TARGET="$(uname -m)-apple-macos13.0"
     "$ROOT/sources/KeyMap.swift" \
     "$ROOT/sources/VirtualKeyboardClient.swift" \
     "$ROOT/sources/Input.swift" \
+    "$ROOT/sources/FramePipeline.swift" \
     "$ROOT/sources/Capture.swift" \
     "$ROOT/sources/LinkInterfaces.swift" \
     "$ROOT/sources/Discovery.swift" \
@@ -225,8 +282,8 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>org.locachy.extdisplay.sender</string>
 <key>CFBundleName</key><string>LOCachy Extended Display</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.6.2</string>
-<key>CFBundleVersion</key><string>0.6.2</string>
+<key>CFBundleShortVersionString</key><string>0.6.3</string>
+<key>CFBundleVersion</key><string>0.6.3</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Discover and connect to the LOCachy extended display over a dedicated Thunderbolt or USB4 link.</string>
@@ -236,7 +293,10 @@ cat >"$APP/Contents/Info.plist" <<'PLIST'
 <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
 </dict></plist>
 PLIST
-SIGN_DIR="${LOCACHY_SIGN_DIR:-${HOME:-$OUT}/Library/Application Support/LOCachy}"
+trap cleanup_sign_stage EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+SIGN_DIR="${LOCACHY_SIGN_DIR:-$REAL_HOME/Library/Application Support/LOCachy}"
 sign_outputs "$PRODUCT" "$APP" "$SIGN_DIR" "$OUT" "$HELPER"
 
 printf 'PASS: built %s\n' "$PRODUCT"
